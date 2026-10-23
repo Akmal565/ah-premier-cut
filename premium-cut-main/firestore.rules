@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /templates/{templateId} {
+      allow read: if true;
+      allow create, update, delete: if request.auth != null;
+    }
+
+    // Text styles are published by trusted tooling and read directly by the editor.
+    // The app syncs both collection names, so uploads land in the panel either way.
+    match /text_templates/{textTemplateId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /textTemplates/{textTemplateId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /creators/{creatorId} {
+      allow read: if true;
+      allow create, update: if request.auth != null;
+    }
+
+    match /effects/{effectId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /effects_assets/{assetId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /editor_tools/{toolId} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}

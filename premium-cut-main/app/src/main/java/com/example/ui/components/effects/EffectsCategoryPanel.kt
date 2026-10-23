@@ -1,0 +1,383 @@
+package com.example.ui.components.effects
+
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.engine.composition.gpu.VfxStageHealth
+import com.example.engine.effects.EffectThumbnailRaster
+import com.example.engine.effects.GlslSwatchRenderer
+import com.example.engine.effects.ProductionEffectApplicator
+import com.example.engine.effects.registry.EffectCategory
+import com.example.engine.effects.registry.EffectsAssetRegistry
+import com.example.engine.effects.registry.RegisteredEffect
+import com.example.ui.StudioViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+
+/**
+ * Effects category panel: live clip-frame thumbnails, real registry effects only.
+ */
+@Composable
+fun EffectsCategoryPanel(
+  category: EffectCategory,
+  viewModel: StudioViewModel,
+  onClose: () -> Unit,
+  onApply: (RegisteredEffect?) -> Unit,
+  onIntensity: (RegisteredEffect, Float) -> Unit = { _, _ -> },
+  modifier: Modifier = Modifier
+) {
+  val context = LocalContext.current
+  val timeline by viewModel.timelineEngine.timeline.collectAsState()
+  val selectedElement by viewModel.timelineEngine.selectedElement.collectAsState()
+  // Selection-only changes must retarget the panel: keying the target clip on the timeline
+  // alone kept resolving (and writing to) whichever clip was selected before the last tap.
+  val clip = remember(timeline, selectedElement) { viewModel.targetClipForEffects() }
+  val registrySnapshot = EffectsAssetRegistry.snapshot()
+
+  var searchQuery by remember(category) { mutableStateOf("") }
+  var draftSelectedEffect by remember(category, clip?.id) { mutableStateOf<RegisteredEffect?>(null) }
+  var isNoneSelected by remember(category, clip?.id) { mutableStateOf(false) }
+  var strength by remember(category, clip?.id) { mutableFloatStateOf(1f) }
+
+  LaunchedEffect(category, clip?.id) {
+    val current = viewModel.targetClipForEffects()
+    val applied = ProductionEffectApplicator.appliedOn(current, category)
+    draftSelectedEffect = applied
+    isNoneSelected = applied == null
+    strength = applied?.let { ProductionEffectApplicator.intensityOn(current, it) } ?: 1f
+  }
+
+  val availableEffects = remember(category, searchQuery, registrySnapshot) {
+    EffectsAssetRegistry.searchEffects(category, searchQuery)
+  }
+
+  val panelBackground = Brush.verticalGradient(
+    colors = listOf(Color(0xFF0A2B27), Color(0xFF0F263B))
+  )
+
+  Column(
+    modifier = modifier
+      .fillMaxWidth()
+      .heightIn(min = 260.dp, max = 380.dp)
+      .height(320.dp)
+      .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+      .background(panelBackground)
+      .border(1.dp, Color(0xFF164746), RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+      .padding(horizontal = 14.dp, vertical = 8.dp)
+      .testTag("effects_panel_${category.name.lowercase()}")
+  ) {
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(bottom = 10.dp),
+      horizontalArrangement = Arrangement.SpaceBetween,
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      IconButton(
+        onClick = onClose,
+        modifier = Modifier.size(38.dp).testTag("effects_close_btn")
+      ) {
+        Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
+      }
+
+      Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Color(0xFF071B20),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.5f)),
+        modifier = Modifier
+          .weight(1f)
+          .height(38.dp)
+          .padding(horizontal = 8.dp)
+      ) {
+        Row(
+          modifier = Modifier.fillMaxSize().padding(horizontal = 10.dp),
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+          Icon(Icons.Default.Search, contentDescription = "Search", tint = Color(0xFF10B981), modifier = Modifier.size(16.dp))
+          Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+            if (searchQuery.isEmpty()) {
+              Text("Search ${category.displayName}...", color = Color(0xFF64748B), fontSize = 13.sp)
+            }
+            BasicTextField(
+              value = searchQuery,
+              onValueChange = { searchQuery = it },
+              textStyle = TextStyle(color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium),
+              cursorBrush = SolidColor(Color(0xFF10B981)),
+              singleLine = true,
+              modifier = Modifier.fillMaxWidth().testTag("effects_search_input")
+            )
+          }
+          if (searchQuery.isNotEmpty()) {
+            IconButton(onClick = { searchQuery = "" }, modifier = Modifier.size(20.dp)) {
+              Icon(Icons.Default.Close, contentDescription = "Clear search", tint = Color(0xFF94A3B8), modifier = Modifier.size(14.dp))
+            }
+          }
+        }
+      }
+
+      IconButton(
+        onClick = {
+          if (isNoneSelected) onApply(null)
+          else draftSelectedEffect?.let { onIntensity(it, strength) }
+          onClose()
+        },
+        modifier = Modifier.size(38.dp).testTag("effects_confirm_btn")
+      ) {
+        Icon(Icons.Default.Check, contentDescription = "Apply Effect", tint = Color(0xFF10B981))
+      }
+    }
+
+    if (draftSelectedEffect != null && !isNoneSelected) {
+      Text(
+        text = "Strength ${(strength * 100).toInt()}%",
+        color = Color(0xFF99F6E4),
+        fontSize = 12.sp,
+        modifier = Modifier.padding(bottom = 2.dp)
+      )
+      Slider(
+        value = strength,
+        onValueChange = { value ->
+          strength = value
+          draftSelectedEffect?.let { onIntensity(it, value) }
+        },
+        valueRange = 0f..1f,
+        modifier = Modifier.fillMaxWidth().testTag("effect_strength_slider")
+      )
+    }
+
+    LazyVerticalGrid(
+      columns = GridCells.Fixed(4),
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
+      verticalArrangement = Arrangement.spacedBy(8.dp),
+      modifier = Modifier.fillMaxWidth().weight(1f)
+    ) {
+      item {
+        val isSelected = isNoneSelected || draftSelectedEffect == null
+        Surface(
+          shape = RoundedCornerShape(10.dp),
+          color = if (isSelected) Color(0xFF10B981).copy(alpha = 0.25f) else Color(0xFF0F2F32),
+          border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (isSelected) Color(0xFF10B981) else Color(0xFF1E5253)
+          ),
+          modifier = Modifier
+            .fillMaxWidth()
+            .height(86.dp)
+            .clickable {
+              isNoneSelected = true
+              draftSelectedEffect = null
+              onApply(null)
+            }
+            .testTag("effect_none_option")
+        ) {
+          Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(4.dp)
+          ) {
+            Icon(
+              imageVector = Icons.Default.Block,
+              contentDescription = "None",
+              tint = if (isSelected) Color(0xFF10B981) else Color.White,
+              modifier = Modifier.size(20.dp)
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text("None", color = Color.White, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal, fontSize = 11.sp)
+          }
+        }
+      }
+
+      items(availableEffects, key = { it.id }) { effect ->
+        val isSelected = !isNoneSelected && draftSelectedEffect?.id == effect.id
+        Surface(
+          shape = RoundedCornerShape(10.dp),
+          color = if (isSelected) Color(0xFF10B981).copy(alpha = 0.25f) else Color(0xFF0E2530),
+          border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (isSelected) Color(0xFF10B981) else Color(0xFF1A4557)
+          ),
+          modifier = Modifier
+            .fillMaxWidth()
+            .height(86.dp)
+            .clickable {
+              // The EditorScreen.onApply callback shows a detailed diagnostic Toast with the
+              // result (clip id, stack size, compositor state, rendered frames). This tile's
+              // job is just to select + fire onApply; the Toast feedback is centralized there
+              // so the user sees one informative message, not two overlapping ones.
+              isNoneSelected = false
+              draftSelectedEffect = effect
+              strength = 1f
+              onApply(effect)
+            }
+            .testTag("effect_item_${effect.id}")
+        ) {
+          Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(4.dp)
+          ) {
+            // The tile's base is the asset's own real poster artwork (Explosion shows a
+            // fireball, Fire shows flames) — never the clip's video frame. The live shader
+            // animates over that poster, so the tile is recognizable AND genuinely animated.
+            EffectLiveSwatch(
+              shaderKey = effect.shaderKey,
+              baseBitmap = remember(effect.id) { EffectPosterCache.forEffectId(context, effect.id) },
+              modifier = Modifier.fillMaxWidth().height(40.dp).clip(RoundedCornerShape(6.dp))
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+              text = effect.name,
+              color = Color.White,
+              fontSize = 10.sp,
+              maxLines = 2,
+              overflow = TextOverflow.Ellipsis,
+              textAlign = TextAlign.Center
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+@Composable
+internal fun EffectLiveSwatch(
+  shaderKey: String?,
+  baseBitmap: Bitmap?,
+  modifier: Modifier = Modifier
+) {
+  // One small shared sample (the clip's own frame when available) keeps every animated
+  // tile cheap: 96px raster, ~20 fps, triple-buffered so nothing allocates per frame.
+  val sample = remember(baseBitmap) { bitmapSample(baseBitmap, SWATCH_PX) ?: EffectThumbnailRaster.baseScene(SWATCH_PX) }
+
+  // The GPU stage quarantined this id on THIS device: the live preview cannot draw it, so the
+  // tile flags itself instead of silently implying "this is what your video will look like".
+  val quarantined by VfxStageHealth.quarantinedIds.collectAsState()
+  val deviceUnsupported = quarantined.contains(shaderKey?.removePrefix(VFX_KEY_PREFIX))
+
+  if (shaderKey.isNullOrBlank()) {
+    // No shader on this entry: the untouched frame IS the truth for it.
+    val frame = remember(sample) {
+      Bitmap.createBitmap(sample, SWATCH_PX, SWATCH_PX, Bitmap.Config.ARGB_8888).asImageBitmap()
+    }
+    Image(
+      bitmap = frame,
+      contentDescription = null,
+      contentScale = ContentScale.Crop,
+      modifier = modifier
+    )
+    return
+  }
+
+  var shown by remember(shaderKey) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+  LaunchedEffect(shaderKey, sample) {
+    // Stagger tiles so a grid of live swatches never rasterises in lockstep.
+    delay((shaderKey.hashCode().mod(6)) * 12L)
+    val n = SWATCH_PX
+    val bufs = Array(3) { IntArray(n * n) }
+    val frames = Array(3) { Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888) }
+    var slot = 0
+    var lastT = -1f
+    // GPU first (the real shader, pixel-faithful to the video); CPU raster as the fallback.
+    // Three consecutive GPU failures (no EGL / driver refuses) park this tile on the raster.
+    var gpuOk = shaderKey.startsWith(VFX_KEY_PREFIX) && GlslSwatchRenderer.available
+    var gpuFails = 0
+    val startNs = System.nanoTime()
+    withContext(Dispatchers.Default) {
+      while (isActive) {
+        val t = (System.nanoTime() - startNs) / 1_000_000_000f
+        if (t - lastT >= 0.05f) {
+          lastT = t
+          val out = bufs[slot]
+          var ok = false
+          if (gpuOk) {
+            ok = GlslSwatchRenderer.render(shaderKey, sample, n, t, out)
+            if (ok) gpuFails = 0 else if (++gpuFails >= 3) gpuOk = false
+          }
+          if (!ok) {
+            EffectThumbnailRaster.renderInto(
+              shaderKey, sample, out, n, n,
+              t % EffectThumbnailRaster.LIVE_LOOP_SECONDS
+            )
+          }
+          frames[slot].setPixels(out, 0, n, 0, 0, n, n)
+          val frame = frames[slot].asImageBitmap()
+          withContext(Dispatchers.Main.immediate) { shown = frame }
+          slot = (slot + 1) % 3
+        }
+        delay(16)
+      }
+    }
+  }
+  val img = shown
+  Box(modifier = modifier) {
+    if (img != null) {
+      Image(
+        bitmap = img,
+        contentDescription = shaderKey,
+        contentScale = ContentScale.Crop,
+        modifier = Modifier.fillMaxSize()
+      )
+    } else {
+      Box(Modifier.fillMaxSize().background(Color(0xFF071419)))
+    }
+    if (deviceUnsupported) {
+      Box(
+        Modifier
+          .align(Alignment.TopEnd)
+          .padding(3.dp)
+          .size(9.dp)
+          .background(Color(0xFFFFB020), CircleShape)
+      )
+    }
+  }
+}
+
+private const val VFX_KEY_PREFIX = "vfx:"
+private const val SWATCH_PX = 96
+
+private fun bitmapSample(base: Bitmap?, n: Int): IntArray? {
+  if (base == null || base.isRecycled || base.width <= 0 || base.height <= 0) return null
+  return runCatching {
+    val scaled = Bitmap.createScaledBitmap(base, n, n, true)
+    IntArray(n * n).also { px ->
+      scaled.getPixels(px, 0, n, 0, 0, n, n)
+      if (scaled !== base) scaled.recycle()
+    }
+  }.getOrNull()
+}

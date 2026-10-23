@@ -1,0 +1,932 @@
+package com.vfx.engine.gpu.glsl
+
+/**
+ * Real GLSL bodies for built-in effects.
+ * Every body defines `vec4 process(vec4 c, vec2 uv)`; distortion/warp bodies
+ * additionally define `vec2 warpUV(vec2 uv)`. Effect uniforms are declared inline.
+ */
+object EffectGlsl {
+
+    // ---------------- COLOR ----------------
+    const val BRIGHTNESS = """
+uniform float u_amount;
+vec4 process(vec4 c, vec2 uv){ c.rgb += u_amount; return c; }"""
+
+    const val CONTRAST = """
+uniform float u_contrast;
+vec4 process(vec4 c, vec2 uv){ c.rgb = (c.rgb - 0.5) * u_contrast + 0.5; return c; }"""
+
+    const val EXPOSURE = """
+uniform float u_stops;
+vec4 process(vec4 c, vec2 uv){ c.rgb *= exp2(u_stops); return c; }"""
+
+    const val GAMMA = """
+uniform float u_gamma;
+vec4 process(vec4 c, vec2 uv){ c.rgb = pow(max(c.rgb, vec3(0.0)), vec3(1.0 / max(u_gamma, 0.01))); return c; }"""
+
+    const val SATURATION = """
+uniform float u_sat;
+vec4 process(vec4 c, vec2 uv){ float l = luma709(c.rgb); c.rgb = mix(vec3(l), c.rgb, u_sat); return c; }"""
+
+    const val VIBRANCE = """
+uniform float u_vibrance;
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    float sat = maxc(c.rgb) - minc(c.rgb);
+    c.rgb = mix(vec3(l), c.rgb, 1.0 + sat * u_vibrance);
+    return c;
+}"""
+
+    const val HUE = """
+uniform float u_degrees;
+vec4 process(vec4 c, vec2 uv){
+    vec3 hsv = rgb2hsv(c.rgb);
+    hsv.x = fract(hsv.x + u_degrees / 360.0);
+    c.rgb = hsv2rgb(hsv);
+    return c;
+}"""
+
+    const val TEMPERATURE = """
+uniform float u_temp;
+uniform float u_tint;
+vec4 process(vec4 c, vec2 uv){
+    c.r *= 1.0 + 0.12 * u_temp;
+    c.b *= 1.0 - 0.12 * u_temp;
+    c.g *= 1.0 + 0.08 * u_tint;
+    return c;
+}"""
+
+    const val HIGHLIGHTS_SHADOWS = """
+uniform float u_highlights;
+uniform float u_shadows;
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    float hw = smoothstep(0.5, 1.0, l);
+    float sw = 1.0 - smoothstep(0.0, 0.5, l);
+    vec3 hDir = u_highlights >= 0.0 ? (1.0 - c.rgb) : c.rgb;
+    vec3 sDir = u_shadows >= 0.0 ? (1.0 - c.rgb) : c.rgb;
+    c.rgb += hw * u_highlights * hDir;
+    c.rgb += sw * u_shadows * sDir;
+    return c;
+}"""
+
+    const val WHITES_BLACKS = """
+uniform float u_whites;
+uniform float u_blacks;
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    float ww = smoothstep(0.6, 1.0, l);
+    float bw = 1.0 - smoothstep(0.0, 0.4, l);
+    vec3 wDir = u_whites >= 0.0 ? (1.0 - c.rgb) : c.rgb;
+    vec3 bDir = u_blacks >= 0.0 ? (1.0 - c.rgb) : c.rgb;
+    c.rgb += ww * u_whites * wDir;
+    c.rgb += bw * u_blacks * bDir;
+    return c;
+}"""
+
+    const val LEVELS = """
+uniform float u_inBlack;
+uniform float u_inWhite;
+uniform float u_gamma;
+uniform float u_outBlack;
+uniform float u_outWhite;
+vec4 process(vec4 c, vec2 uv){
+    vec3 v = clamp((c.rgb - vec3(u_inBlack)) / max(u_inWhite - u_inBlack, 1.0e-4), vec3(0.0), vec3(1.0));
+    v = pow(v, vec3(1.0 / max(u_gamma, 0.01)));
+    c.rgb = v * (u_outWhite - u_outBlack) + u_outBlack;
+    return c;
+}"""
+
+    const val CURVES = """
+uniform sampler2D u_curveLut;
+vec4 process(vec4 c, vec2 uv){
+    c.r = texture(u_curveLut, vec2(clamp(c.r, 0.0, 1.0), 0.5)).r;
+    c.g = texture(u_curveLut, vec2(clamp(c.g, 0.0, 1.0), 0.5)).g;
+    c.b = texture(u_curveLut, vec2(clamp(c.b, 0.0, 1.0), 0.5)).b;
+    return c;
+}"""
+
+    const val COLOR_BALANCE = """
+uniform vec3 u_shadows;
+uniform vec3 u_midtones;
+uniform vec3 u_highlights;
+uniform float u_preserveLuma;
+// Declared before use: GLSL requires functions to be defined before they are called.
+float l0Guard(float l){ return l; }
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    float sw = pow(1.0 - l, 2.0);
+    float hw = pow(l, 2.0);
+    float mw = clamp(1.0 - sw - hw, 0.0, 1.0);
+    vec3 adj = c.rgb + sw * u_shadows + mw * u_midtones + hw * u_highlights;
+    if (u_preserveLuma > 0.5) {
+        float l1 = luma709(adj);
+        adj *= (l0Guard(l) + 1.0e-4) / (l1 + 1.0e-4);
+    }
+    c.rgb = adj;
+    return c;
+}"""
+
+    const val CHANNEL_MIXER = """
+uniform vec3 u_rowR;
+uniform vec3 u_rowG;
+uniform vec3 u_rowB;
+vec4 process(vec4 c, vec2 uv){
+    c.rgb = mat3(u_rowR, u_rowG, u_rowB) * c.rgb;
+    return c;
+}"""
+
+    const val HSL_BANDS = """
+uniform float u_hueShift[6];
+uniform float u_satScale[6];
+uniform float u_lumScale[6];
+vec4 process(vec4 c, vec2 uv){
+    vec3 hsv = rgb2hsv(c.rgb);
+    float hDeg = hsv.x * 360.0;
+    float hueOff = 0.0, satMul = 1.0, lumMul = 1.0;
+    for (int i = 0; i < 6; i++) {
+        float d = hueDist(hDeg, float(i) * 60.0);
+        float w = 1.0 - smoothstep(30.0, 60.0, d);
+        hueOff += u_hueShift[i] * w;
+        satMul += (u_satScale[i] - 1.0) * w;
+        lumMul += (u_lumScale[i] - 1.0) * w;
+    }
+    hsv.x = fract(hsv.x + hueOff / 360.0);
+    hsv.y = clamp(hsv.y * satMul, 0.0, 1.0);
+    hsv.z = clamp(hsv.z * lumMul, 0.0, 1.0);
+    c.rgb = hsv2rgb(hsv);
+    return c;
+}"""
+
+    const val SELECTIVE_COLOR = """
+uniform float u_cmyDelta[27];
+vec4 process(vec4 c, vec2 uv){
+    vec3 hsv = rgb2hsv(c.rgb);
+    float hDeg = hsv.x * 360.0;
+    float l = luma709(c.rgb);
+    vec3 cmy = vec3(1.0) - c.rgb;
+    for (int i = 0; i < 9; i++) {
+        float w;
+        if (i < 6) {
+            float d = hueDist(hDeg, float(i) * 60.0);
+            w = 1.0 - smoothstep(30.0, 60.0, d);
+        } else if (i == 6) { w = smoothstep(0.75, 0.95, l); }
+        else if (i == 7) { w = 1.0 - smoothstep(0.0, 0.25, abs(l - 0.5)); }
+        else { w = 1.0 - smoothstep(0.05, 0.25, l); }
+        vec3 delta = vec3(u_cmyDelta[i * 3], u_cmyDelta[i * 3 + 1], u_cmyDelta[i * 3 + 2]);
+        cmy = clamp(cmy + delta * w, vec3(0.0), vec3(1.0));
+    }
+    c.rgb = clamp(vec3(1.0) - cmy, vec3(0.0), vec3(1.0));
+    return c;
+}"""
+
+    // ---------------- BLUR ----------------
+    const val SEPARABLE_BLUR = """
+uniform vec2 u_dir;
+uniform float u_weights[33];
+uniform int u_taps;
+vec4 process(vec4 c, vec2 uv){
+    vec4 acc = vec4(0.0);
+    float wsum = 0.0;
+    for (int i = 0; i < 33; i++) {
+        if (i >= u_taps) break;
+        float w = u_weights[i];
+        vec2 off = u_dir * float(i - (u_taps - 1) / 2);
+        acc += texture(u_tex, clampUv(uv + off)) * w;
+        wsum += w;
+    }
+    c = acc / max(wsum, 1.0e-5);
+    return c;
+}"""
+
+    const val DIRECTIONAL_BLUR = """
+uniform vec2 u_dir;
+uniform int u_samples;
+uniform float u_amount;
+vec4 process(vec4 c, vec2 uv){
+    if (u_amount <= 0.001) return c;
+    vec4 acc = vec4(0.0);
+    float jitter = hash21(uv * u_resolution) - 0.5;
+    for (int i = 0; i < 64; i++) {
+        if (i >= u_samples) break;
+        float t = (float(i) + jitter) / float(u_samples) - 0.5;
+        acc += texture(u_tex, clampUv(uv + u_dir * t * u_amount));
+    }
+    c = acc / float(u_samples);
+    return c;
+}"""
+
+    const val RADIAL_BLUR = """
+uniform vec2 u_center;
+uniform float u_strength;
+uniform int u_samples;
+vec4 process(vec4 c, vec2 uv){
+    vec2 d = uv - u_center;
+    vec4 acc = vec4(0.0);
+    for (int i = 0; i < 64; i++) {
+        if (i >= u_samples) break;
+        float t = float(i) / float(u_samples) - 0.5;
+        acc += texture(u_tex, clampUv(uv - d * t * u_strength));
+    }
+    c = acc / float(u_samples);
+    return c;
+}"""
+
+    const val ZOOM_BLUR = """
+uniform vec2 u_center;
+uniform float u_strength;
+uniform int u_samples;
+vec4 process(vec4 c, vec2 uv){
+    vec4 acc = vec4(0.0);
+    for (int i = 0; i < 64; i++) {
+        if (i >= u_samples) break;
+        float t = float(i) / float(u_samples);
+        vec2 su = mix(uv, u_center + (uv - u_center) * (1.0 - u_strength), t);
+        acc += texture(u_tex, clampUv(su));
+    }
+    c = acc / float(u_samples);
+    return c;
+}"""
+
+    // ---------------- SHARPEN ----------------
+    const val SHARPEN_3X3 = """
+uniform float u_amount;
+vec4 process(vec4 c, vec2 uv){
+    vec3 acc = vec3(0.0);
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        vec3 s = texture(u_tex, clampUv(uv + vec2(float(dx), float(dy)) * u_texel)).rgb;
+        float w = (dx == 0 && dy == 0) ? (1.0 + 4.0 * u_amount) : -u_amount;
+        acc += s * w;
+    }
+    c.rgb = acc;
+    return c;
+}"""
+
+    const val UNSHARP_COMBINE = """
+uniform sampler2D u_blurred;
+uniform float u_amount;
+vec4 process(vec4 c, vec2 uv){
+    vec3 blur = texture(u_blurred, uv).rgb;
+    c.rgb = c.rgb + (c.rgb - blur) * u_amount;
+    return c;
+}"""
+
+    // ---------------- LIGHT ----------------
+    const val BLOOM_THRESHOLD = """
+uniform float u_threshold;
+uniform float u_knee;
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    float soft = u_threshold + u_knee;
+    float w = clamp((l - u_threshold) / max(soft - u_threshold, 1.0e-4), 0.0, 1.0);
+    c.rgb *= w;
+    return c;
+}"""
+
+    const val BLOOM_COMBINE = """
+uniform sampler2D u_bloom;
+uniform float u_bloomIntensity;
+vec4 process(vec4 c, vec2 uv){
+    vec3 b = texture(u_bloom, uv).rgb;
+    c.rgb = 1.0 - (1.0 - c.rgb) * (1.0 - min(b * u_bloomIntensity, vec3(1.0)));
+    return c;
+}"""
+
+    const val GLOW_COMBINE = """
+uniform sampler2D u_blurred;
+uniform float u_glowStrength;
+vec4 process(vec4 c, vec2 uv){
+    vec3 b = texture(u_blurred, uv).rgb;
+    c.rgb = blendScreen(c.rgb, b * u_glowStrength);
+    return c;
+}"""
+
+    const val LIGHT_RAYS = """
+uniform vec2 u_lightPos;
+uniform float u_rayLength;
+uniform float u_decay;
+uniform float u_rayStrength;
+uniform int u_raySamples;
+vec4 process(vec4 c, vec2 uv){
+    vec2 dir = u_lightPos - uv;
+    vec3 rays = vec3(0.0);
+    float w = 1.0;
+    for (int i = 0; i < 64; i++) {
+        if (i >= u_raySamples) break;
+        float t = float(i) / float(u_raySamples);
+        rays += texture(u_tex, clampUv(uv + dir * t * u_rayLength)).rgb * w;
+        w *= u_decay;
+    }
+    c.rgb += rays * u_rayStrength;
+    return c;
+}"""
+
+    const val VIGNETTE = """
+uniform vec2 u_center;
+uniform float u_start;
+uniform float u_end;
+uniform vec4 u_vigColor;
+uniform float u_vigAmount;
+vec4 process(vec4 c, vec2 uv){
+    vec2 d = uv - u_center;
+    d.x *= u_resolution.x / max(u_resolution.y, 1.0);
+    float r = length(d);
+    float m = 1.0 - smoothstep(u_start, u_end, r);
+    vec3 target = mix(u_vigColor.rgb, c.rgb, m);
+    c.rgb = mix(c.rgb, target, u_vigAmount);
+    return c;
+}"""
+
+    // ---------------- DISTORTION ----------------
+    const val LENS_DISTORTION = """
+uniform float u_k1;
+uniform float u_k2;
+vec2 warpUV(vec2 uv){
+    vec2 p = (uv - 0.5) * 2.0;
+    float r2 = dot(p, p);
+    float f = 1.0 + u_k1 * r2 + u_k2 * r2 * r2;
+    return clampUv(p * f * 0.5 + 0.5);
+}
+vec4 process(vec4 c, vec2 uv){ return c; }"""
+
+    const val FISHEYE = """
+uniform float u_fishStrength;
+vec2 warpUV(vec2 uv){
+    vec2 p = (uv - 0.5) * 2.0;
+    float r = length(p);
+    if (r < 1.0e-5) return uv;
+    float rr = mix(r, asin(clamp(r, 0.0, 1.0)) * 1.2732, u_fishStrength);
+    return clampUv(p / r * rr * 0.5 + 0.5);
+}
+vec4 process(vec4 c, vec2 uv){ return c; }"""
+
+    const val RIPPLE = """
+uniform vec2 u_center;
+uniform float u_rippleFreq;
+uniform float u_rippleSpeed;
+uniform float u_rippleAmp;
+uniform float u_rippleFalloff;
+vec2 warpUV(vec2 uv){
+    vec2 d = uv - u_center;
+    float r = length(d);
+    float a = sin(r * u_rippleFreq - u_time * u_rippleSpeed) * u_rippleAmp * exp(-r * u_rippleFalloff);
+    return clampUv(uv + (r > 1.0e-6 ? d / r : vec2(0.0)) * a);
+}
+vec4 process(vec4 c, vec2 uv){ return c; }"""
+
+    const val WAVE = """
+uniform vec2 u_waveDir;
+uniform float u_waveFreq;
+uniform float u_waveSpeed;
+uniform float u_waveAmp;
+vec2 warpUV(vec2 uv){
+    vec2 dir = normalize(u_waveDir + vec2(1.0e-5, 0.0));
+    float s = dot(uv, vec2(-dir.y, dir.x));
+    float off = sin(s * u_waveFreq + u_time * u_waveSpeed) * u_waveAmp;
+    return clampUv(uv + dir * off);
+}
+vec4 process(vec4 c, vec2 uv){ return c; }"""
+
+    const val TURBULENCE = """
+uniform float u_turbFreq;
+uniform float u_turbAmp;
+uniform float u_turbSpeed;
+vec2 warpUV(vec2 uv){
+    float t = u_time * u_turbSpeed;
+    vec2 n = vec2(fbm(uv * u_turbFreq + t), fbm(uv * u_turbFreq + vec2(37.7, 11.3) - t)) - 0.5;
+    return clampUv(uv + n * u_turbAmp);
+}
+vec4 process(vec4 c, vec2 uv){ return c; }"""
+
+    // ---------------- STYLIZE ----------------
+    const val POSTERIZE = """
+uniform float u_levels;
+vec4 process(vec4 c, vec2 uv){ c.rgb = floor(c.rgb * u_levels + 0.5) / u_levels; return c; }"""
+
+    const val THRESHOLD = """
+uniform float u_threshold;
+uniform float u_keepColor;
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    vec3 col = u_keepColor > 0.5 ? c.rgb : vec3(1.0);
+    c.rgb = l >= u_threshold ? col : vec3(0.0);
+    return c;
+}"""
+
+    const val PIXELATE = """
+uniform float u_blocksX;
+uniform float u_blocksY;
+vec2 warpUV(vec2 uv){
+    vec2 g = vec2(max(u_blocksX, 2.0), max(u_blocksY, 2.0));
+    return clampUv((floor(uv * g) + 0.5) / g);
+}
+vec4 process(vec4 c, vec2 uv){ return c; }"""
+
+    const val EDGE_DETECT = """
+uniform float u_edgeStrength;
+uniform vec4 u_edgeFg;
+uniform vec4 u_edgeBg;
+vec4 process(vec4 c, vec2 uv){
+    float tl = luma709(texture(u_tex, clampUv(uv + vec2(-1.0, -1.0) * u_texel)).rgb);
+    float t  = luma709(texture(u_tex, clampUv(uv + vec2( 0.0, -1.0) * u_texel)).rgb);
+    float tr = luma709(texture(u_tex, clampUv(uv + vec2( 1.0, -1.0) * u_texel)).rgb);
+    float l  = luma709(texture(u_tex, clampUv(uv + vec2(-1.0,  0.0) * u_texel)).rgb);
+    float r  = luma709(texture(u_tex, clampUv(uv + vec2( 1.0,  0.0) * u_texel)).rgb);
+    float bl = luma709(texture(u_tex, clampUv(uv + vec2(-1.0,  1.0) * u_texel)).rgb);
+    float b  = luma709(texture(u_tex, clampUv(uv + vec2( 0.0,  1.0) * u_texel)).rgb);
+    float br = luma709(texture(u_tex, clampUv(uv + vec2( 1.0,  1.0) * u_texel)).rgb);
+    float gx = -tl - 2.0 * l - bl + tr + 2.0 * r + br;
+    float gy = -tl - 2.0 * t - tr + bl + 2.0 * b + br;
+    float e = clamp(length(vec2(gx, gy)) * u_edgeStrength, 0.0, 1.0);
+    c.rgb = mix(u_edgeBg.rgb, u_edgeFg.rgb, e);
+    return c;
+}"""
+
+    const val SKETCH = """
+uniform float u_sketchStrength;
+vec4 process(vec4 c, vec2 uv){
+    float tl = luma709(texture(u_tex, clampUv(uv + vec2(-1.0, -1.0) * u_texel)).rgb);
+    float t  = luma709(texture(u_tex, clampUv(uv + vec2( 0.0, -1.0) * u_texel)).rgb);
+    float tr = luma709(texture(u_tex, clampUv(uv + vec2( 1.0, -1.0) * u_texel)).rgb);
+    float l  = luma709(texture(u_tex, clampUv(uv + vec2(-1.0,  0.0) * u_texel)).rgb);
+    float r  = luma709(texture(u_tex, clampUv(uv + vec2( 1.0,  0.0) * u_texel)).rgb);
+    float bl = luma709(texture(u_tex, clampUv(uv + vec2(-1.0,  1.0) * u_texel)).rgb);
+    float b  = luma709(texture(u_tex, clampUv(uv + vec2( 0.0,  1.0) * u_texel)).rgb);
+    float br = luma709(texture(u_tex, clampUv(uv + vec2( 1.0,  1.0) * u_texel)).rgb);
+    float gx = -tl - 2.0 * l - bl + tr + 2.0 * r + br;
+    float gy = -tl - 2.0 * t - tr + bl + 2.0 * b + br;
+    float edge = clamp(length(vec2(gx, gy)) * u_sketchStrength, 0.0, 1.0);
+    float paper = 0.92 + 0.08 * hash21(floor(uv * u_resolution * 0.5));
+    c.rgb = vec3(paper) * (1.0 - edge);
+    return c;
+}"""
+
+    const val EMBOSS = """
+uniform float u_embossAmount;
+vec4 process(vec4 c, vec2 uv){
+    float acc = 0.0;
+    float k[9];
+    k[0] = -2.0; k[1] = -1.0; k[2] = 0.0;
+    k[3] = -1.0; k[4] =  1.0; k[5] = 1.0;
+    k[6] =  0.0; k[7] =  1.0; k[8] = 2.0;
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        int i = (dy + 1) * 3 + (dx + 1);
+        float s = luma709(texture(u_tex, clampUv(uv + vec2(float(dx), float(dy)) * u_texel)).rgb);
+        acc += s * k[i];
+    }
+    c.rgb = vec3(acc * u_embossAmount + 0.5);
+    return c;
+}"""
+
+    const val HALFTONE = """
+uniform float u_dotSize;
+uniform float u_gridAngle;
+uniform vec4 u_dark;
+uniform vec4 u_light;
+vec4 process(vec4 c, vec2 uv){
+    vec2 p = rot2(radians(u_gridAngle)) * uv * u_resolution / max(u_dotSize, 1.0);
+    vec2 f = fract(p) - 0.5;
+    float d = length(f) * 2.0;
+    float l = luma709(c.rgb);
+    float radius = sqrt(clamp(1.0 - l, 0.0, 1.0));
+    float m = smoothstep(radius, radius - 0.08, d);
+    return mix(u_dark, u_light, 1.0 - m);
+}"""
+
+    const val DUOTONE = """
+uniform vec4 u_duoDark;
+uniform vec4 u_duoLight;
+uniform float u_duoDetail;
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    vec3 duo = mix(u_duoDark.rgb, u_duoLight.rgb, clamp(l, 0.0, 1.0));
+    c.rgb = mix(duo, c.rgb, u_duoDetail);
+    return c;
+}"""
+
+    // ---------------- NOISE ----------------
+    const val DIGITAL_NOISE = """
+uniform float u_noiseAmount;
+uniform float u_noiseSeed;
+vec4 process(vec4 c, vec2 uv){
+    float n = hash31(vec3(uv * u_resolution, u_noiseSeed + floor(u_time * 60.0)));
+    c.rgb += (n - 0.5) * u_noiseAmount;
+    return c;
+}"""
+
+    // ---------------- CHROMATIC ----------------
+    const val CHROMATIC_ABERRATION = """
+uniform float u_caAmount;
+uniform vec2 u_caCenter;
+vec4 process(vec4 c, vec2 uv){
+    vec2 d = uv - u_caCenter;
+    c.r = texture(u_tex, clampUv(uv + d * u_caAmount)).r;
+    c.g = texture(u_tex, uv).g;
+    c.b = texture(u_tex, clampUv(uv - d * u_caAmount)).b;
+    return c;
+}"""
+
+    const val GLITCH = """
+uniform float u_amount;
+vec4 process(vec4 c, vec2 uv){
+    float band = floor(uv.y * 28.0);
+    float tick = floor(u_time * 14.0);
+    float j = (hash21(vec2(band, tick)) - 0.5) * u_amount * 2.0;
+    float rowOn = step(0.72, hash21(vec2(band, tick * 0.37)));
+    vec2 shifted = clampUv(uv + vec2(j * rowOn, 0.0));
+    float tear = step(0.92, hash21(vec2(floor(u_time * 9.0), 3.0)));
+    shifted.x += tear * u_amount * 0.35;
+    c.r = texture(u_tex, clampUv(shifted + vec2(u_amount * 0.45, 0.0))).r;
+    c.g = texture(u_tex, shifted).g;
+    c.b = texture(u_tex, clampUv(shifted - vec2(u_amount * 0.45, 0.0))).b;
+    float scan = 0.94 + 0.06 * sin(uv.y * u_resolution.y * 1.6 + u_time * 40.0);
+    c.rgb *= scan;
+    return c;
+}"""
+
+    const val LIGHT_LEAK = """
+uniform float u_amount;
+uniform vec3 u_leakColor;
+vec4 process(vec4 c, vec2 uv){
+    vec2 origin = vec2(0.12 + 0.08 * sin(u_time * 0.35), 0.82);
+    float blob = exp(-length(uv - origin) * 3.2);
+    float streak = exp(-pow((uv.x * 1.4 - 0.2) * 2.2, 2.0)) * smoothstep(0.0, 0.45, uv.y);
+    vec3 leak = u_leakColor * (blob * 1.15 + streak * 0.55) * u_amount;
+    c.rgb = 1.0 - (1.0 - c.rgb) * (1.0 - clamp(leak, 0.0, 1.0));
+    return c;
+}"""
+
+    const val HDR_ENHANCE = """
+uniform float u_amount;
+vec4 process(vec4 c, vec2 uv){
+    float l = luma709(c.rgb);
+    float shadow = smoothstep(0.42, 0.0, l);
+    float highlight = smoothstep(0.58, 1.0, l);
+    vec3 mapped = c.rgb + c.rgb * shadow * 0.35 * u_amount - (c.rgb - vec3(l)) * highlight * 0.15 * u_amount;
+    mapped += shadow * 0.06 * u_amount;
+    float contrast = mix(1.0, 1.18, u_amount);
+    mapped = (mapped - 0.5) * contrast + 0.5;
+    float ll = luma709(mapped);
+    c.rgb = mix(vec3(ll), mapped, mix(1.0, 1.22, u_amount));
+    return c;
+}"""
+
+    const val COLOR_POP = """
+uniform float u_amount;
+uniform float u_hueCenter;
+uniform float u_hueWidth;
+vec4 process(vec4 c, vec2 uv){
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float delta = mx - mn;
+    float hue = 0.0;
+    if (delta > 0.001) {
+        if (mx == c.r) hue = mod((c.g - c.b) / delta, 6.0);
+        else if (mx == c.g) hue = (c.b - c.r) / delta + 2.0;
+        else hue = (c.r - c.g) / delta + 4.0;
+        hue /= 6.0;
+    }
+    float dh = abs(hue - u_hueCenter);
+    dh = min(dh, 1.0 - dh);
+    float keep = 1.0 - smoothstep(u_hueWidth * 0.35, u_hueWidth, dh);
+    float satBoost = delta / max(mx, 0.001);
+    keep *= smoothstep(0.08, 0.22, satBoost);
+    float l = luma709(c.rgb);
+    vec3 grey = vec3(l);
+    c.rgb = mix(mix(grey, c.rgb, 1.0 - u_amount), c.rgb, keep);
+    return c;
+}"""
+
+    const val RGB_SPLIT = """
+uniform vec2 u_splitDir;
+uniform float u_splitAmount;
+vec4 process(vec4 c, vec2 uv){
+    vec2 off = u_splitDir * u_splitAmount;
+    c.r = texture(u_tex, clampUv(uv + off)).r;
+    c.g = texture(u_tex, uv).g;
+    c.b = texture(u_tex, clampUv(uv - off)).b;
+    return c;
+}"""
+
+    // ---------------- TEMPORAL ----------------
+    const val TRAILS = """
+uniform sampler2D u_prev;
+uniform float u_decay;
+vec4 process(vec4 c, vec2 uv){
+    vec3 prev = texture(u_prev, uv).rgb * u_decay;
+    c.rgb = max(c.rgb, prev);
+    return c;
+}"""
+
+    const val ACCUMULATE = """
+uniform sampler2D u_prev;
+uniform float u_alpha;
+vec4 process(vec4 c, vec2 uv){
+    vec3 prev = texture(u_prev, uv).rgb;
+    c.rgb = mix(prev, c.rgb, clamp(u_alpha, 0.0, 1.0));
+    return c;
+}"""
+
+    const val MOTION_TRAIL = TRAILS
+    const val FRAME_ACCUMULATE = ACCUMULATE
+
+    // =========================================================================================
+    // VIDEO EFFECTS — the ten catalog assets in EffectCategory.VIDEO_EFFECTS.
+    // Same body contract as every other effect (`process`, optional `warpUV`), so preview,
+    // thumbnail and export share one implementation per asset.
+    // =========================================================================================
+
+    /** Motion Blur: jittered directional accumulation. */
+    const val MOTION_BLUR = """
+uniform float u_distance;
+uniform float u_angle;
+uniform int u_samples;
+vec4 process(vec4 c, vec2 uv){
+    if (u_distance <= 0.0005 || u_samples < 2) return c;
+    float a = radians(u_angle);
+    vec2 dir = vec2(cos(a), sin(a));
+    // Stable per-pixel jitter: keeps the streak from banding without flickering every frame.
+    float jitter = hash21(uv * u_resolution) - 0.5;
+    vec4 acc = vec4(0.0);
+    for (int i = 0; i < 64; i++) {
+        if (i >= u_samples) break;
+        float t = (float(i) + jitter) / float(u_samples - 1) - 0.5;
+        acc += texture(u_tex, clampUv(uv + dir * t * u_distance));
+    }
+    return acc / float(u_samples);
+}"""
+
+    /** VHS Tape: colour-under chroma bleed, transport jitter, tracking band, hiss, scanlines. */
+    const val VHS_TAPE = """
+uniform float u_bleed;
+uniform float u_noise;
+uniform float u_tracking;
+uniform float u_scanline;
+vec4 process(vec4 c, vec2 uv){
+    float line = floor(uv.y * max(u_resolution.y, 1.0));
+    float frame = floor(u_time * 24.0);
+    float bandPhase = fract(uv.y - u_time * 0.22);
+    float band = smoothstep(0.10, 0.0, abs(bandPhase - 0.5));
+    float jitter = (hash21(vec2(line, frame)) - 0.5) * (0.0015 + 0.012 * u_tracking * band);
+    vec2 juv = clampUv(uv + vec2(jitter, 0.0));
+    vec4 sharp = texture(u_tex, juv);
+    // Chroma bleed: horizontal smear of the colour difference signal only.
+    vec3 chroma = vec3(0.0);
+    for (int i = 0; i < 8; i++) {
+        float t = float(i) / 7.0;
+        chroma += texture(u_tex, clampUv(juv + vec2(t * u_bleed, 0.0))).rgb;
+    }
+    chroma /= 8.0;
+    float sharpLuma = luma709(sharp.rgb);
+    vec3 rgb = vec3(sharpLuma) + (chroma - vec3(luma709(chroma)));
+    // Tape hiss and head dropouts.
+    float hiss = (hash21(vec2(line * 1.37, frame * 2.11)) - 0.5) * u_noise;
+    float dropout = step(0.996 - 0.004 * u_tracking, hash21(vec2(frame, line * 0.73)));
+    rgb += hiss * 0.55 + dropout * 0.22;
+    // Interlaced scanlines and the washed-out VHS chroma.
+    float scan = 1.0 - u_scanline * 0.30 * (0.5 + 0.5 * sin(uv.y * max(u_resolution.y, 1.0) * 3.14159265));
+    rgb *= scan;
+    rgb = mix(rgb, vec3(luma709(rgb)), 0.32);
+    return vec4(rgb, sharp.a);
+}"""
+
+    /** CRT: curved tube, aperture grille, scanlines, mains flicker, phosphor bloom, tube vignette. */
+    const val CRT_SCANLINES = """
+uniform float u_curvature;
+uniform float u_scanline;
+uniform float u_grille;
+uniform float u_flicker;
+uniform float u_vignette;
+vec2 warpUV(vec2 uv){
+    vec2 p = (uv - 0.5) * 2.0;
+    float r2 = dot(p, p);
+    return clampUv(p * (1.0 + u_curvature * r2) * 0.5 + 0.5);
+}
+vec4 process(vec4 c, vec2 uv){
+    vec2 s = clampUv(mix(uv, warpUV(uv), clamp(u_warpIntensity, 0.0, 1.0)));
+    float resX = max(u_resolution.x, 1.0);
+    float resY = max(u_resolution.y, 1.0);
+    float triad = fract(s.x * resX / 3.0);
+    vec3 grille = vec3(
+        step(triad, 0.3333),
+        step(0.3333, triad) * step(triad, 0.6667),
+        step(0.6667, triad));
+    grille = mix(vec3(1.0), grille * 1.55 + 0.35, clamp(u_grille, 0.0, 1.0));
+    float scan = 1.0 - u_scanline * 0.45 * (0.5 + 0.5 * sin(s.y * resY * 3.14159265));
+    float flicker = 1.0 - u_flicker * 0.10 * (0.5 + 0.5 * sin(u_time * 41.0));
+    float vig = 1.0 - u_vignette * smoothstep(0.25, 0.85, length(s - 0.5));
+    vec3 rgb = c.rgb * grille * scan * flicker * vig;
+    // Phosphor bleed from the neighbouring line, strongest where the scanline is dark.
+    rgb += texture(u_tex, clampUv(s + vec2(0.0, u_texel.y))).rgb * (1.0 - scan) * 0.35;
+    return vec4(rgb, c.a);
+}"""
+
+    /** Datamosh: time-varying macroblock displacement, flat blocks and channel tear. */
+    const val DATAMOSH = """
+uniform float u_amount;
+uniform float u_blockSize;
+uniform float u_smear;
+vec4 process(vec4 c, vec2 uv){
+    float bs = max(u_blockSize, 6.0);
+    vec2 blocks = max(u_resolution / bs, vec2(2.0));
+    vec2 cell = floor(uv * blocks);
+    float tick = floor(u_time * 6.0);
+    float h = hash21(cell + vec2(tick * 0.37, tick * 0.11));
+    float active = step(1.0 - clamp(u_smear, 0.0, 1.0), h);
+    vec2 dir = vec2(hash21(cell + 2.3) - 0.5, hash21(cell + 7.9) - 0.5) * 2.0;
+    vec2 cellCenter = (cell + 0.5) / blocks;
+    // Pull the block colour from a neighbour: the classic datamosh smear.
+    vec3 pulled = texture(u_tex, clampUv(cellCenter + dir * u_amount * active)).rgb;
+    vec3 rgb = mix(c.rgb, pulled, active * 0.85);
+    // Channel tear on the strongest blocks.
+    float tear = step(0.86, h);
+    rgb.r = texture(u_tex, clampUv(uv + vec2(u_amount * 0.5 * tear, 0.0))).r;
+    rgb.b = texture(u_tex, clampUv(uv - vec2(u_amount * 0.5 * tear, 0.0))).b;
+    return vec4(rgb, c.a);
+}"""
+
+    /** Anamorphic Streak: horizontal highlight streak (lens flare family). */
+    const val ANAMORPHIC_STREAK = """
+uniform float u_amount;
+uniform float u_threshold;
+uniform float u_length;
+uniform vec3 u_tint;
+vec4 process(vec4 c, vec2 uv){
+    vec3 streak = vec3(0.0);
+    float total = 0.0;
+    for (int i = 0; i < 33; i++) {
+        float t = float(i) / 32.0 - 0.5;
+        float w = exp(-abs(t) * 6.0);
+        vec3 s = texture(u_tex, clampUv(uv + vec2(t * u_length * 2.0, 0.0))).rgb;
+        streak += s * w * smoothstep(u_threshold, u_threshold + 0.30, luma709(s));
+        total += w;
+    }
+    streak /= max(total, 1.0e-4);
+    c.rgb += streak * u_tint * u_amount * 2.4;
+    return c;
+}"""
+
+    /** Film Grain: sized, luminance-shaped grain with optional chroma noise. */
+    const val FILM_GRAIN_PRO = """
+uniform float u_amount;
+uniform float u_size;
+uniform float u_shadow;
+uniform float u_chroma;
+vec4 process(vec4 c, vec2 uv){
+    float frame = floor(u_time * 24.0);
+    vec2 p = uv * max(u_resolution, vec2(1.0)) / max(u_size, 0.25);
+    float n = hash21(floor(p) + vec2(frame * 7.13, frame * 3.71)) - 0.5;
+    float n2 = hash21(floor(p * 1.7) + vec2(frame * 2.9, frame * 5.1)) - 0.5;
+    float l = luma709(c.rgb);
+    float shape = mix(1.0, 1.6 - 1.4 * smoothstep(0.0, 0.7, l), clamp(u_shadow, 0.0, 1.0));
+    float amt = u_amount * shape;
+    c.rgb += n * amt;
+    c.rgb += vec3(n2 - n) * amt * clamp(u_chroma, 0.0, 1.0) * 0.5;
+    return c;
+}"""
+
+    /** Halation: red-weighted highlight bleed around bright edges (film stock look). */
+    const val HALATION = """
+uniform float u_amount;
+uniform float u_radius;
+uniform float u_threshold;
+uniform vec3 u_tint;
+vec4 process(vec4 c, vec2 uv){
+    vec3 glow = vec3(0.0);
+    float total = 0.0;
+    for (int i = 0; i < 16; i++) {
+        float a = float(i) * 0.39269908;
+        float w = 1.0 - float(i) / 24.0;
+        vec3 s = texture(u_tex, clampUv(uv + vec2(cos(a), sin(a)) * u_radius)).rgb;
+        glow += s * w * smoothstep(u_threshold, u_threshold + 0.30, luma709(s));
+        total += w;
+    }
+    for (int i = 0; i < 8; i++) {
+        float a = float(i) * 0.78539816 + 0.4;
+        vec3 s = texture(u_tex, clampUv(uv + vec2(cos(a), sin(a)) * u_radius * 2.2)).rgb;
+        glow += s * 0.4 * smoothstep(u_threshold, u_threshold + 0.30, luma709(s));
+        total += 0.4;
+    }
+    glow = glow / max(total, 1.0e-4) * u_tint;
+    c.rgb = 1.0 - (1.0 - c.rgb) * (1.0 - clamp(glow * u_amount * 2.4, 0.0, 1.0));
+    return c;
+}"""
+
+    /** Lens Flare: halo + mirrored ghosts + anamorphic bar around a light position. */
+    const val LENS_FLARE = """
+uniform vec2 u_position;
+uniform float u_amount;
+uniform float u_halo;
+uniform float u_ghosts;
+uniform vec3 u_tint;
+vec4 process(vec4 c, vec2 uv){
+    vec2 toCenter = vec2(0.5) - u_position;
+    vec2 luv = uv - u_position;
+    vec3 flare = u_tint * exp(-length(luv) * 4.0) * u_halo;
+    // Ghost elements mirrored through the frame centre.
+    vec3 ghosts = vec3(0.0);
+    for (int i = 1; i <= 3; i++) {
+        float k = float(i) * 0.55;
+        vec2 gp = u_position + toCenter * (2.0 * k);
+        ghosts += u_tint * exp(-length(uv - gp) * 22.0) * (0.65 / float(i));
+    }
+    float bar = exp(-abs(luv.y) * 60.0) * exp(-abs(luv.x) * 6.0);
+    flare += ghosts * u_ghosts + u_tint * bar * u_ghosts * 0.7;
+    c.rgb += flare * u_amount * 1.8;
+    return c;
+}"""
+
+    /** Speed Lines: anime-style radial streaks that animate outward from a centre. */
+    const val SPEED_LINES = """
+uniform vec2 u_center;
+uniform float u_amount;
+uniform float u_lines;
+uniform float u_speed;
+uniform float u_reach;
+vec4 process(vec4 c, vec2 uv){
+    vec2 d = uv - u_center;
+    float r = length(d);
+    if (r < 1.0e-4) return c;
+    float angle = atan(d.y, d.x) / 6.2831853 + 0.5;
+    float seg = floor(angle * max(u_lines, 2.0));
+    float seed = hash21(vec2(seg, floor(u_time * max(u_speed, 0.0) * 6.0)));
+    float line = smoothstep(0.55, 1.0, seed);
+    vec3 streak = vec3(0.0);
+    for (int i = 0; i < 12; i++) {
+        float t = float(i) / 11.0;
+        streak += texture(u_tex, clampUv(uv - d * t * u_reach)).rgb;
+    }
+    streak /= 12.0;
+    float mask = line * clamp(u_amount, 0.0, 1.0) * smoothstep(0.02, 0.32, r);
+    vec3 rgb = mix(c.rgb, streak, mask);
+    rgb += line * mask * 0.05;
+    return vec4(rgb, c.a);
+}"""
+
+    /** Kaleidoscope: polar wedge fold with rotation and zoom. */
+    const val KALEIDOSCOPE = """
+uniform vec2 u_center;
+uniform float u_segments;
+uniform float u_rotation;
+uniform float u_zoom;
+vec2 warpUV(vec2 uv){
+    vec2 p = uv - u_center;
+    float r = length(p) / max(u_zoom, 0.05);
+    if (r < 1.0e-5) return uv;
+    float wedge = 6.2831853 / max(u_segments, 2.0);
+    float a = atan(p.y, p.x) + radians(u_rotation);
+    a = mod(a, wedge);
+    a = abs(a - wedge * 0.5);
+    return clampUv(u_center + vec2(cos(a), sin(a)) * r);
+}
+vec4 process(vec4 c, vec2 uv){ return c; }"""
+
+    // ---------------- MASK COMBINE (single shared program; masks are UNIFORMS, never baked source) ----------------
+    const val MASK_COMBINE = """
+uniform sampler2D u_effect;
+uniform float u_opacity;
+uniform int u_blendMode;
+uniform sampler2D u_maskTex;
+uniform int u_maskType;        // 1 rect, 2 circle, 3 ellipse, 4 linear, 5 radial, 6 texture
+uniform vec4 u_maskA;
+uniform vec4 u_maskB;
+uniform float u_maskInvert;
+float maskFactor(vec2 uv) {
+    float m = 1.0;
+    if (u_maskType == 1) {
+        vec2 p = uv - u_maskA.xy;
+        float ca = cos(radians(u_maskB.x)), sa = sin(radians(u_maskB.x));
+        p = mat2(ca, -sa, sa, ca) * p;
+        float sd = sdRoundBox(p, u_maskA.zw * 0.5, u_maskB.y);
+        float f = max(u_maskB.z, 0.0001);
+        m = 1.0 - smoothstep(-f, f, sd);
+    } else if (u_maskType == 2) {
+        float d = length(uv - u_maskA.xy) - u_maskA.z;
+        float f = max(u_maskB.z, 0.0001);
+        m = 1.0 - smoothstep(-f, f, d);
+    } else if (u_maskType == 3) {
+        vec2 p = uv - u_maskA.xy;
+        float ca = cos(radians(u_maskB.x)), sa = sin(radians(u_maskB.x));
+        p = mat2(ca, -sa, sa, ca) * p / max(u_maskA.zw, vec2(1.0e-4));
+        float d = (length(p) - 1.0) * min(u_maskA.z, u_maskA.w);
+        float f = max(u_maskB.z, 0.0001);
+        m = 1.0 - smoothstep(-f, f, d);
+    } else if (u_maskType == 4) {
+        float t = dot(uv, u_maskA.xy);
+        m = clamp((t - u_maskB.z) / max(u_maskB.w - u_maskB.z, 1.0e-4), 0.0, 1.0);
+    } else if (u_maskType == 5) {
+        float d = length(uv - u_maskA.xy);
+        m = 1.0 - smoothstep(u_maskA.z, u_maskA.w, d);
+    } else if (u_maskType == 6) {
+        m = texture(u_maskTex, clampUv(uv)).r;
+    }
+    return mix(m, 1.0 - m, u_maskInvert);
+}
+vec4 process(vec4 c, vec2 uv){
+    float m = clamp(maskFactor(uv), 0.0, 1.0);
+    vec4 fx = texture(u_effect, uv);
+    return blendComposite(c, fx, u_blendMode, m * u_opacity);
+}"""
+}

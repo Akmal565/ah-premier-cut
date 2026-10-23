@@ -1,0 +1,1841 @@
+package com.example.engine.playback
+
+import android.content.Context
+import android.graphics.ColorMatrix
+import android.graphics.SurfaceTexture
+import android.os.SystemClock
+import android.util.Log
+import androidx.annotation.OptIn
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.SeekParameters
+import com.example.domain.model.Timeline
+import com.example.domain.model.TrackType
+import com.example.domain.model.VideoClip
+import com.example.domain.model.effectiveAdjustments
+import com.example.domain.model.timelineToSourceMs
+import com.example.engine.audio.AudioEffectsPreviewCache
+import com.example.engine.controller.CustomVideoEngineController
+import com.example.engine.controller.PlaybackSyncPolicy
+import com.example.engine.controller.PreviewMixPolicy
+import com.example.engine.color.ColorEngineHost
+import com.example.engine.effects.media3.ColorGradingGlEffect
+import com.example.engine.effects.media3.ColorGradingSnapshot
+import com.example.engine.effects.media3.LivePreviewLook
+import com.example.engine.effects.media3.LutStripBaker
+import com.example.engine.effects.media3.Media3EffectPipeline
+import com.example.engine.effects.media3.PreviewDeferredFlushPolicy
+import com.example.engine.effects.media3.PreviewEffectApplyPolicy
+import com.example.engine.effects.media3.PreviewFilterEffects
+import com.example.engine.effects.media3.PreviewGraphDecision
+import com.example.engine.effects.media3.PreviewLookPolicy
+import com.example.engine.media.MediaPlayableUri
+import com.example.engine.media.MediaRelinkManager
+import com.example.engine.preview.PreviewCompositionPolicy
+import com.example.engine.preview.PreviewCompositor
+import com.example.engine.preview.PreviewCompositorPolicy
+import com.example.engine.preview.PreviewCompositorSettings
+import com.example.engine.preview.PreviewFramePlan
+import com.example.engine.preview.PreviewLayerPlanner
+import com.example.engine.preview.CompositorActivationPolicy
+import com.example.engine.preview.SingleClockPreviewCompositor
+import com.example.ui.components.player.PreviewVideoSurfaceRegistry
+import androidx.media3.common.Effect
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.pow
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Public playback facade retained for the existing editor UI.
+ * All primary playback/seek/surface commands are delegated to one CustomVideoEngineController -> PlaybackController.
+ * No independent elapsed-realtime playback clock is used here.
+ */
+@OptIn(UnstableApi::class)
+class VideoPlaybackEngine(
+  private val context: Context,
+  onTimelinePositionChanged: (Long) -> Unit,
+  onPlaybackEnded: () -> Unit,
+  private val proxyEngine: ProxyMediaEngine? = null,
+  /**
+   * Called when the system paused playback (audio focus lost to another app, headphones
+   * unplugged). The editor playhead is clock driven, so the timeline transport has to stop
+   * with the player; otherwise the CTI keeps counting while the picture is frozen.
+   */
+  private val onPlaybackInterrupted: () -> Unit = {}
+) {
+  companion object {
+    private const val TAG = "VideoPlaybackEngine"
+    private const val UI_TICK_MS = 16L
+    private const val PAUSED_SEEK_EPSILON_MS = 30L
+    /**
+     * Minimum gap between two repaints of the held (paused) frame. Slider drags emit far
+     * faster than this, so the trailing repaint in [requestPausedFrameRefresh] guarantees
+     * the LAST value still reaches the screen instead of being swallowed by the throttle.
+     */
+    private const val PAUSED_REPAINT_INTERVAL_MS = 40L
+    /** How often a failed Media3 graph may retry one rebuild (device recovered, new look, ...). */
+    private const val LOOK_FALLBACK_RETRY_MS = 5_000L
+    /** How often a failed compositor activation may retry (one transient decode failure must not
+     *  disable auto-activation for the whole session). */
+    private const val COMPOSITOR_RETRY_MS = 5_000L
+    /** Minimum gap between two compositor playability disk-probes (see refreshCompositorMode). */
+    private const val PLAYABLE_PROBE_THROTTLE_MS = 1_200L
+  }
+
+  private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+  private var trimPollJob: Job? = null
+  private val seekGeneration = AtomicLong(0L)
+
+  private val _isPlaying = MutableStateFlow(false)
+  val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
+  private val _currentPositionMs = MutableStateFlow(0L)
+  val currentPositionMs: StateFlow<Long> = _currentPositionMs.asStateFlow()
+  private val _activeClip = MutableStateFlow<VideoClip?>(null)
+  val activeClip: StateFlow<VideoClip?> = _activeClip.asStateFlow()
+  private val _playerError = MutableStateFlow<String?>(null)
+  val playerError: StateFlow<String?> = _playerError.asStateFlow()
+  private val _trimPlaybackPositionMs = MutableStateFlow(0L)
+  val trimPlaybackPositionMs: StateFlow<Long> = _trimPlaybackPositionMs.asStateFlow()
+  /**
+   * Ids of the overlay clips whose ExoPlayer currently exists.
+   * The preview surface is a plain texture view inside an AndroidView, so the UI cannot
+   * observe `getOverlayPlayer()` (a map lookup). Publishing the id set makes the video
+   * layer appear as soon as its player is created instead of after an unrelated recomposition.
+   */
+  private val _overlayPlayerIds = MutableStateFlow<Set<String>>(emptySet())
+  val overlayPlayerIds: StateFlow<Set<String>> = _overlayPlayerIds.asStateFlow()
+  /**
+   * Increments whenever the preview ExoPlayer is recreated. Compose must observe this so
+   * AndroidView / TextureView re-binds to the new instance instead of a released player.
+   */
+  private val _playerGeneration = MutableStateFlow(0)
+  val playerGeneration: StateFlow<Int> = _playerGeneration.asStateFlow()
+
+  /**
+   * True while the GPU compositor draws the picture. ExoPlayers then only play audio: the main
+   * player's video track is disabled and overlay players exist only for audible overlays.
+   */
+  private val _compositorActive = MutableStateFlow(false)
+  val compositorActive: StateFlow<Boolean> = _compositorActive.asStateFlow()
+  private var compositor: PreviewCompositor? = null
+  /** Set when the compositor could not decode a main-track clip; retried once per cooldown
+   *  (COMPOSITOR_RETRY_MS) while the project still needs the compositor, or cleared when the setting changes. */
+  private var compositorFailed = false
+  private var compositorFailedAtElapsedMs = 0L
+
+  /**
+   * Presentation-verified activation watchdog + bounded self-retry state.
+   *
+   * The reported device bug: the first activation failed transiently (codec contention with the
+   * still-live player, cold first decode) and the fallback left the look invisible on the player
+   * path, with the retry gated on the NEXT unrelated user action. Both recovery paths below are
+   * event-driven and bounded - never a refresh loop:
+   *  - the watchdog verifies REAL presentation (renderedFrames), not the "active" flag;
+   *  - a failed activation self-retries at most [CompositorActivationPolicy.MAX_SELF_RETRIES]
+   *    times per failure streak, and the streak resets when a compositor that had actually
+   *    presented frames is torn down.
+   */
+  private var compositorWatchJob: Job? = null
+  private var compositorWatchBaseline = 0L
+  private var compositorSelfRetryJob: Job? = null
+  private var compositorSelfRetries = 0
+
+  /** Compose-observable presentation evidence of the active compositor (null = compositor off). */
+  private val _compositorStats = MutableStateFlow<PreviewCompositor.Stats?>(null)
+  val compositorStatsFlow: StateFlow<PreviewCompositor.Stats?> = _compositorStats.asStateFlow()
+  private var compositorStatsJob: Job? = null
+
+  private class CompositorSurface(val texture: SurfaceTexture, val width: Int, val height: Int)
+  /** Live compositor views; the most recently attached one (fullscreen dialog over inline) is drawn. */
+  private val compositorSurfaces = ArrayList<CompositorSurface>()
+
+  private var currentTimeline = Timeline()
+  private var currentPosMs = 0L
+  private var isScrubbingMode = false
+  private var wasPlayingBeforeScrub = false
+  private var isTrimPreviewMode = false
+  private var trimPreviewClip: VideoClip? = null
+  private var trimRangeStartMs = 0L
+  private var trimRangeEndMs = 0L
+
+  val engineController: CustomVideoEngineController = CustomVideoEngineController(
+    context = context,
+    onTimelinePositionChanged = { pos ->
+      currentPosMs = pos
+      _currentPositionMs.value = pos
+      val nextClip = findClipAt(pos)
+      val graphChanged = PreviewFilterEffects.media3GraphSignature(nextClip, currentTimeline) != lastMedia3GraphSignature
+      _activeClip.value = nextClip
+      if (graphChanged) {
+        applyActiveLookToPlayers()
+      } else {
+        publishLiveGrading(nextClip)
+      }
+      syncOverlayPlayers(pos)
+      syncAudioTrackPlayers(pos)
+      onTimelinePositionChanged(pos)
+    },
+    onPlaybackEnded = {
+      _isPlaying.value = false
+      onPlaybackEnded()
+    },
+    proxyEngine = proxyEngine
+  )
+
+  val player: ExoPlayer get() = engineController.player
+  val isScrubbing: Boolean get() = isScrubbingMode
+  val isTrimPreview: Boolean get() = isTrimPreviewMode
+
+  val previewCompositor = SingleClockPreviewCompositor(context)
+  private val overlayPlayers = ConcurrentHashMap<String, ExoPlayer>()
+  private val overlayLoadedUris = ConcurrentHashMap<String, String>()
+  private val audioTrackPlayers = ConcurrentHashMap<String, ExoPlayer>()
+  private val audioLoadedUris = ConcurrentHashMap<String, String>()
+  private val secondaryCorrectionAtMs = ConcurrentHashMap<String, Long>()
+  private var lastPreviewFilterSignature: String? = null
+  private var lastMedia3Signature: String? = null
+  private var lastMedia3GraphSignature: String? = null
+  private var lastGoodMedia3Effects: List<Effect> = emptyList()
+  private var pendingMedia3Effects: List<Effect>? = null
+  private var boundMainGrading: ColorGradingGlEffect? = null
+  private val boundOverlayGrading = ConcurrentHashMap<String, ColorGradingGlEffect>()
+  private val lastOverlayGraphSignatures = ConcurrentHashMap<String, String>()
+  private val lastOverlayFilterSignatures = ConcurrentHashMap<String, String>()
+  @Volatile private var applyingEffects = false
+  @Volatile private var recreatingPlayer = false
+  @Volatile private var deferredLooksPending = false
+  /** Attempt counter of the CURRENT deferred-look retry episode (see [scheduleDeferredLookFlush]). */
+  private var deferredFlushAttempts = 0
+  /** Bounded auto-retry that flushes a deferred look once the TextureView is available again. */
+  private var deferredFlushJob: Job? = null
+  /** True while the device could only run the identity passthrough (no grading node available). */
+  @Volatile private var lookFallbackActive = false
+
+  /** Cooldown before [lookFallbackActive] is allowed one more graph retry (see applyActiveLookToPlayers). */
+  private var lastLookFallbackAtElapsedMs = 0L
+
+  /** Disk-probe throttle for the compositor playability check (no cache inside isRealPlayableMedia). */
+  private var lastPlayableProbeAtElapsedMs = 0L
+  /** Visible-clip id set the cached [lastPlayableProbeResult] was computed for: a scrub that
+   *  brings different sources under the playhead must re-probe even inside the throttle window. */
+  private var lastProbedVisibleKey: List<String> = emptyList()
+  // Fail-open: before the first probe has ever run, let the compositor activate. A genuinely
+  // undecodable source is caught downstream by the compositor's own decoder failure path
+  // (onMainLayerUndecodable -> player fallback); a false default here instead blocked the FIRST
+  // activation on devices that had been up for less than the probe throttle window.
+  private var lastPlayableProbeResult = true
+  /**
+   * Set for the duration of an export (see [suspendPreviewForExport]): blocks compositor
+   * re-activation and overlay/audio player re-allocation so the export owns the codec budget.
+   * Cleared by [prepareForEditorEntry] when the editor is entered again.
+   */
+  @Volatile private var previewSuspendedForExport = false
+  private var lastPresentAtElapsedMs = 0L
+  private var lastPresentPosMs = -1L
+  /** Throttle for the paused-repaint probe-rejection log (see presentCurrentFrame). */
+  private var lastPresentProbeRejectLogAtMs = 0L
+  /** 1/s throttle for the "filter state submitted" diagnostic (see publishLiveLook). */
+  private var lastLookSubmitLogAtMs = 0L
+  /** 1/s throttle for the "first valid preview frame" diagnostic (see onRenderedFirstFrame). */
+  private var lastFirstFrameLogAtMs = 0L
+  private var spatialLookJob: Job? = null
+  /** Trailing repaint of the held frame so a fast slider drag cannot drop its final value. */
+  private var pausedRepaintJob: Job? = null
+
+  private val previewPlayerListener = object : Player.Listener {
+    override fun onIsPlayingChanged(isPlaying: Boolean) {
+      _isPlaying.value = isPlaying
+      if (isTrimPreviewMode && isPlaying) startTrimPolling() else trimPollJob?.cancel()
+    }
+    override fun onPlaybackStateChanged(state: Int) {
+      // A clip that loads fine again must clear the previous error, otherwise the stale
+      // message stayed on the preview for the rest of the session.
+      if (state == Player.STATE_READY) _playerError.value = null
+    }
+    override fun onRenderedFirstFrame() {
+      commitPendingMedia3Effects("firstFrame")
+      // "First valid preview frame available" diagnostic. Edge-triggered (1/s): Media3 fires
+      // this per seek/present while scrubbing, so it must not become a per-frame log.
+      val now = SystemClock.elapsedRealtime()
+      if (now - lastFirstFrameLogAtMs > 1_000L) {
+        lastFirstFrameLogAtMs = now
+        Log.i(TAG, "Preview frame presented pos=${currentPosMs}ms compositor=${_compositorActive.value}")
+      }
+    }
+    override fun onPlayerError(error: PlaybackException) {
+      _playerError.value = "${error.errorCodeName}: ${error.message}"
+      Log.e(TAG, "Preview player error", error)
+      recoverFromPreviewEffectError(error)
+    }
+
+    override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+      if (playWhenReady) return
+      // setVideoEffects can briefly drop playWhenReady while the graph rebuilds.
+      // That is not an audio-focus loss and must not pause the mix / clock.
+      if (applyingEffects) return
+      val systemPausedUs = reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS ||
+        reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY
+      if (!systemPausedUs) return
+      Log.d(TAG, "Playback interrupted by the system (reason=$reason)")
+      engineController.pause()
+      overlayPlayers.values.forEach { try { it.pause() } catch (_: Exception) {} }
+      audioTrackPlayers.values.forEach { try { it.pause() } catch (_: Exception) {} }
+      _isPlaying.value = false
+      onPlaybackInterrupted()
+    }
+  }
+
+  init {
+    PreviewVideoSurfaceRegistry.onPlayerSurfaceBound = { bound ->
+      if (bound === player) {
+        flushDeferredLooks("surfaceBound")
+        presentCurrentFrame(rebindSurface = false)
+      }
+    }
+    attachPreviewPlayerListener()
+    PreviewCompositorSettings.load(context)
+    scope.launch {
+      PreviewCompositorSettings.enabled.collect {
+        compositorFailed = false
+        refreshCompositorMode()
+      }
+    }
+  }
+
+  private fun refreshCompositorMode() {
+    // While an export runs, the preview must not re-allocate what suspendPreviewForExport freed
+    // (compositor decoders + GL context): the export owns the codec budget. Timeline updates still
+    // reach the engine during export, so the guard has to live here, not only at the call site.
+    if (previewSuspendedForExport) {
+      if (_compositorActive.value) teardownCompositor()
+      return
+    }
+    // Chroma key and background removal are per-pixel effects: the player path cannot draw them, only the
+    // GPU compositor can - and that is the same compositing the export runs, so both agree. A project that
+    // uses either effect therefore switches the compositor on by itself; the Settings switch stays as an
+    // explicit "always use the GPU preview".
+    //
+    // lookFallbackActive is the THIRD such case: the device already reported that its Media3 effects
+    // pipeline can only run the identity passthrough, so the player path can draw NO look at all -
+    // filter taps would stay invisible forever. The compositor is the one renderer that draws every
+    // look with the export shaders, so it takes over look rendering for that device.
+    val requiresComposition = PreviewCompositionPolicy.requiresCompositor(currentTimeline) || lookFallbackActive
+    val alwaysOn = PreviewCompositorSettings.enabled.value
+    val active = _compositorActive.value
+    // One transient failure (a decoder slot still held by an overlay player, a slow first decode)
+    // used to latch compositorFailed for the whole session, silently disabling every later
+    // effect tap. Retry once per cooldown window while the project still needs the compositor.
+    if (compositorFailed && requiresComposition &&
+      SystemClock.elapsedRealtime() - compositorFailedAtElapsedMs > COMPOSITOR_RETRY_MS
+    ) {
+      Log.i(TAG, "Retrying the GPU compositor after a previous failure (cooldown elapsed)")
+      compositorFailed = false
+    }
+    // The playability probe below touches the disk for the clips the CURRENT frame decodes only
+    // (no cache inside isRealPlayableMedia). Skip it entirely when the decision cannot depend on
+    // it: nothing needs the compositor, none is running, and the user did not ask for the
+    // always-on GPU preview. Look-only edits (slider ticks) reach this on every tick and must
+    // stay pure-Kotlin cheap.
+    if (!alwaysOn && !requiresComposition && !active) return
+    // The probe verdict is keyed by the visible-clip id set: a scrub that brings different
+    // sources under the playhead re-probes even inside the throttle window, slider ticks reuse it.
+    val visibleKey = PreviewFramePlan.clipsVisibleAt(currentTimeline, currentPosMs).map { it.id }
+    val cachedProbe = SystemClock.elapsedRealtime() - lastPlayableProbeAtElapsedMs < PLAYABLE_PROBE_THROTTLE_MS &&
+      visibleKey == lastProbedVisibleKey
+    val sourcesPlayable = if (cachedProbe) {
+      lastPlayableProbeResult
+    } else {
+      // Resolve every probed clip's uri the SAME way the compositor's decoders will (proxy /
+      // relink). Probing the raw project uri answered "not playable" for proxy-served clips that
+      // playback plays fine, which kept the compositor off and made every effect invisible.
+      val probed = PreviewFramePlan.canComposite(currentTimeline, currentPosMs) { clip ->
+        isPlayableInPlayer(
+          MediaPlayableUri.resolvePlayableString(
+            context,
+            proxyEngine?.getProxyUri(clip) ?: clip.uri
+          )
+        )
+      }
+      lastPlayableProbeAtElapsedMs = SystemClock.elapsedRealtime()
+      lastProbedVisibleKey = visibleKey
+      lastPlayableProbeResult = probed
+      probed
+    }
+    val wanted = PreviewCompositionPolicy.shouldActivate(
+      alwaysOn = alwaysOn,
+      compositorFailed = compositorFailed,
+      trimPreviewActive = isTrimPreviewMode,
+      sourcesPlayable = sourcesPlayable,
+      requiresPixelEffects = requiresComposition
+    )
+    if (wanted == active) {
+      if (wanted) compositor?.updateTimeline(currentTimeline)
+      return
+    }
+    // Render-mode transition diagnostic: name the gate that decided, so a failing-vs-working
+    // trace comparison shows WHY the preview switched (or did not switch) to the compositor.
+    Log.i(
+      TAG,
+      "Preview render mode -> ${if (wanted) "GPU compositor" else "player path"}: " +
+        PreviewCompositionPolicy.explain(currentTimeline, alwaysOn, compositorFailed, isTrimPreviewMode, sourcesPlayable)
+    )
+    if (wanted) enterCompositorMode() else exitCompositorMode()
+  }
+
+  private fun enterCompositorMode() {
+    val c = PreviewCompositor(
+      context = context.applicationContext,
+      positionMs = ::compositorPositionMs,
+      isPlaying = { engineController.timelineSyncManager.isPlaying },
+      resolveUri = { clip -> MediaPlayableUri.resolvePlayableString(context, proxyEngine?.getProxyUri(clip) ?: clip.uri) },
+      onMainLayerUndecodable = { clipId ->
+        scope.launch {
+          Log.w(TAG, "GPU preview cannot decode main clip $clipId; falling back to the player preview")
+          compositorFailed = true
+          compositorFailedAtElapsedMs = SystemClock.elapsedRealtime()
+          refreshCompositorMode()
+          scheduleCompositorSelfRetry("main clip $clipId undecodable")
+        }
+      }
+    )
+    // Free the player's video decoder BEFORE the compositor opens its own: both claim MediaCodec
+    // slots for the SAME file. The compositor's first decode used to race the still-live player
+    // decoder (the track was disabled only AFTER the compositor had started) and on devices with
+    // a single hardware slot for this resolution that first decode failed - which used to trip
+    // onMainLayerUndecodable and latch the failure. The overlay release below already followed
+    // this rule; the main player was the one decoder still held.
+    setVideoTrackDisabled(player, true)
+    // Free the overlay decoders BEFORE the compositor opens its own: both claim MediaCodec slots,
+    // and starting the compositor while the overlay players still run starved its first decode -
+    // which used to trip onMainLayerUndecodable and latch the failure.
+    releaseOverlayPlayers()
+    c.updateTimeline(currentTimeline)
+    compositorSurfaces.lastOrNull()?.let { c.attachSurface(it.texture, it.width, it.height) }
+    compositor = c
+    _compositorActive.value = true
+    applyMainVideoTrackMode()
+    syncOverlayPlayers(currentPosMs)
+    watchCompositorStats(c)
+    scheduleCompositorPresentationWatch()
+    Log.i(TAG, "GPU preview compositor active")
+  }
+
+  private fun exitCompositorMode() {
+    teardownCompositor()
+    releaseOverlayPlayers()
+    applyMainVideoTrackMode()
+    lastMedia3GraphSignature = null
+    boundMainGrading = null
+    PreviewVideoSurfaceRegistry.attachRememberedPrimary(player)
+    applyActiveLookToPlayers(force = false)
+    presentCurrentFrame()
+    syncOverlayPlayers(currentPosMs)
+    Log.i(TAG, "GPU preview compositor inactive; using player preview")
+  }
+
+  private fun teardownCompositor() {
+    val c = compositor ?: return
+    compositor = null
+    _compositorActive.value = false
+    // A compositor that actually presented frames proves the device CAN run the GPU preview:
+    // a later, unrelated breakage must get fresh self-retries instead of inheriting the old count.
+    if (c.stats.value.renderedFrames > 0L) compositorSelfRetries = 0
+    cancelCompositorWatch()
+    compositorStatsJob?.cancel()
+    compositorStatsJob = null
+    _compositorStats.value = null
+    c.detachSurface()
+    c.release()
+  }
+
+  /**
+   * Verifies an activation with REAL presentation evidence: [CompositorActivationPolicy]
+   * single check per activation; when no frame was rendered on the attached surface in time,
+   * the activation failed on this device - fall back and self-retry (bounded).
+   */
+  private fun scheduleCompositorPresentationWatch() {
+    cancelCompositorWatch()
+    val c = compositor ?: return
+    compositorWatchBaseline = c.stats.value.renderedFrames
+    compositorWatchJob = scope.launch {
+      delay(CompositorActivationPolicy.PRESENTATION_PROBE_MS)
+      val active = compositor ?: return@launch
+      if (!_compositorActive.value) return@launch
+      if (CompositorActivationPolicy.presentedSince(compositorWatchBaseline, active.stats.value.renderedFrames)) {
+        compositorSelfRetries = 0
+        return@launch
+      }
+      Log.w(
+        TAG,
+        "GPU preview presented no frame in ${CompositorActivationPolicy.PRESENTATION_PROBE_MS}ms - " +
+          "falling back (selfRetry=$compositorSelfRetries/${CompositorActivationPolicy.MAX_SELF_RETRIES})"
+      )
+      compositorFailed = true
+      compositorFailedAtElapsedMs = SystemClock.elapsedRealtime()
+      refreshCompositorMode()
+      scheduleCompositorSelfRetry("no presented frame within the activation probe")
+    }
+  }
+
+  private fun cancelCompositorWatch() {
+    compositorWatchJob?.cancel()
+    compositorWatchJob = null
+  }
+
+  /**
+   * ONE bounded, event-driven re-activation after a real failure (transient decode failure,
+   * silent activation). On the fallback path this device class draws no look at all, so waiting
+   * for the next user action is exactly what kept every later tap invisible. Bounded by
+   * [CompositorActivationPolicy.MAX_SELF_RETRIES] per streak - a recovery, not a refresh loop.
+   */
+  private fun scheduleCompositorSelfRetry(reason: String) {
+    if (compositorSelfRetryJob != null) return
+    if (!CompositorActivationPolicy.canSelfRetry(compositorSelfRetries)) {
+      Log.w(TAG, "GPU preview stays on the player path (self-retry budget exhausted; $reason)")
+      return
+    }
+    compositorSelfRetryJob = scope.launch {
+      delay(COMPOSITOR_RETRY_MS)
+      compositorSelfRetryJob = null
+      if (_compositorActive.value || previewSuspendedForExport) return@launch
+      if (!PreviewCompositionPolicy.requiresCompositor(currentTimeline)) return@launch
+      compositorSelfRetries++
+      Log.i(TAG, "GPU preview self-retry $compositorSelfRetries/${CompositorActivationPolicy.MAX_SELF_RETRIES} ($reason)")
+      compositorFailed = false
+      refreshCompositorMode()
+    }
+  }
+
+  /** Forwards the active compositor's stats into a stable Compose-observable flow. */
+  private fun watchCompositorStats(c: PreviewCompositor) {
+    compositorStatsJob?.cancel()
+    compositorStatsJob = scope.launch {
+      c.stats.collect { _compositorStats.value = it }
+    }
+  }
+
+  /** Read on the compositor GL thread: the master clock and the StateFlow are both thread-safe. */
+  private fun compositorPositionMs(): Long {
+    val sync = engineController.timelineSyncManager
+    return if (sync.isPlaying) sync.masterClock.calculateCurrentPosition() else _currentPositionMs.value
+  }
+
+  private fun applyMainVideoTrackMode() {
+    setVideoTrackDisabled(player, _compositorActive.value)
+  }
+
+  private fun setVideoTrackDisabled(p: ExoPlayer, disabled: Boolean) {
+    try {
+      val params = p.trackSelectionParameters
+      if (params.disabledTrackTypes.contains(C.TRACK_TYPE_VIDEO) == disabled) return
+      p.trackSelectionParameters = params.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, disabled).build()
+    } catch (t: Throwable) {
+      Log.w(TAG, "Could not switch the video track (disabled=$disabled)", t)
+    }
+  }
+
+  private fun releaseOverlayPlayers() {
+    overlayPlayers.values.forEach { p ->
+      PreviewVideoSurfaceRegistry.forget(p)
+      try { p.stop(); p.clearVideoSurface(); p.release() } catch (_: Exception) {}
+    }
+    overlayPlayers.clear()
+    overlayLoadedUris.clear()
+    currentTimeline.overlayClips.forEach { secondaryCorrectionAtMs.remove(it.id) }
+    lastOverlayGraphSignatures.clear()
+    lastOverlayFilterSignatures.clear()
+    boundOverlayGrading.clear()
+    _overlayPlayerIds.value = emptySet()
+  }
+
+  /** Binds a compositor TextureView. Call from the UI thread. */
+  fun attachCompositorSurface(texture: SurfaceTexture, width: Int, height: Int) {
+    compositorSurfaces.removeAll { it.texture === texture }
+    compositorSurfaces.add(CompositorSurface(texture, width, height))
+    if (compositor != null && compositorWatchJob == null) scheduleCompositorPresentationWatch()
+    compositor?.attachSurface(texture, width, height)
+  }
+
+  /**
+   * Diagnostics / instrumented tests: presentation counters of the active compositor
+   * (rendered frames, average frame time, open decoders, last position). Null when the
+   * compositor is off - a non-null value with advancing [PreviewCompositor.Stats.renderedFrames]
+   * is the proof that the GPU path is actually presenting frames.
+   */
+  fun compositorStats(): PreviewCompositor.Stats? = compositor?.stats?.value
+
+  /**
+   * One-line diagnostic of the Media3 player path state, for the effect-apply banner. Tells us
+   * exactly WHY the Media3 path is (or is not) rendering the VFX on a real device:
+   *   surfaceBound   — is the player's TextureView attached?
+   *   fallback       — did the device report it can only run identity passthrough?
+   *   resident       — is there a ColorGradingGlEffect installed in the player graph?
+   *   deferred       — is the look apply waiting for a surface to bind?
+   *   graphSig       — the last structural graph id (shows the VFX stack signature)
+   *
+   * This is read-only and thread-safe; it snapshots the fields at the call site.
+   */
+  fun media3Diagnostic(): String {
+    val surfaceBound = runCatching { PreviewVideoSurfaceRegistry.hasBoundSurface(player) }.getOrDefault(false)
+    val graphSig = lastMedia3GraphSignature ?: "null"
+    return "surfaceBound=$surfaceBound | fallback=$lookFallbackActive | resident=${boundMainGrading != null} | deferred=$deferredLooksPending | graphSig=${graphSig.take(40)}"
+  }
+
+  /** Must run before the TextureView releases [texture]; re-binds the previous view if one is left. */
+  fun detachCompositorSurface(texture: SurfaceTexture) {
+    val wasCurrent = compositorSurfaces.lastOrNull()?.texture === texture
+    compositorSurfaces.removeAll { it.texture === texture }
+    if (compositorSurfaces.isEmpty()) cancelCompositorWatch()
+    if (!wasCurrent) return
+    val c = compositor ?: return
+    c.detachSurface()
+    compositorSurfaces.lastOrNull()?.let { c.attachSurface(it.texture, it.width, it.height) }
+  }
+
+  private fun attachPreviewPlayerListener() {
+    try { player.addListener(previewPlayerListener) } catch (_: Throwable) {}
+  }
+
+  fun isPlayableInPlayer(uriString: String?): Boolean = MediaRelinkManager.isRealPlayableMedia(context, uriString)
+
+  /**
+   * Applies the selected Filters-tools look to the live ExoPlayer preview.
+   *
+   * The look is rebuilt from the active clip's filter + adjustments (the same ColorGrading
+   * shader the export uses), so the incoming export ColorMatrix is intentionally unused.
+   * It used to be silently dropped, which made the call look like it did nothing.
+   */
+  fun applyVideoFilter(@Suppress("UNUSED_PARAMETER") colorMatrix: ColorMatrix?) {
+    applyActiveLookToPlayers()
+  }
+
+  /**
+   * Pushes clip-local (or timeline) filter + adjustments + LUT onto ExoPlayer via Media3 effects.
+   * [force] rebinds even when the look signature is unchanged (needed after a failed setVideoEffects
+   * or when the paused frame must be redrawn). [preferClipId] uses that main-track clip's look when
+   * the playhead is still on a different clip (filter tap before seek).
+   */
+  /**
+   * Live Filters / Adjust / Video Quality entry point.
+   *
+   * Writes [look] into the in-memory timeline, pushes the new values onto the resident
+   * ColorGrading node **of the clip the look belongs to** (not merely the clip under the
+   * playhead), and repaints the held frame so the change is on screen on the very next
+   * presented frame. Never rebuilds ExoPlayer, drops the decoder or seeks away.
+   */
+  fun publishLiveLook(look: LivePreviewLook) {
+    // "Filter state submitted" diagnostic. Edge-triggered (1/s) so a slider drag logs the
+    // submit point without turning into a per-tick log.
+    val nowMs = SystemClock.elapsedRealtime()
+    if (nowMs - lastLookSubmitLogAtMs > 1_000L) {
+      lastLookSubmitLogAtMs = nowMs
+      Log.i(
+        TAG,
+        "Live look submitted clip=${look.clipId ?: "playhead"} filter=${look.filter.type.name}" +
+          "@${look.filter.intensity} residentNode=${boundMainGrading != null} " +
+          "compositor=${_compositorActive.value}"
+      )
+    }
+    replaceTimelineLooks(
+      timeline = PreviewLookPolicy.applyLookToTimeline(currentTimeline, look),
+      look = look
+    )
+  }
+
+  /**
+   * Updates the in-memory timeline look without reloading decoders or seeking.
+   * Filter / adjust / quality values publish onto the resident ColorGrading
+   * node. LUT / VFX graph changes are latest-wins coalesced so slider ticks
+   * cannot ANR or call setVideoEffects.
+   *
+   * @param look when non-null, the look is published for the clip it targets instead of
+   *   being inferred from the playhead. A look applied to a clip that is not on screen must
+   *   still grade that clip's node, otherwise the edit looks like it did nothing.
+   */
+  fun replaceTimelineLooks(timeline: Timeline, look: LivePreviewLook? = null) {
+    currentTimeline = timeline
+    // A look-only edit can be the first project change that needs the GPU compositor (a VFX the
+    // player path cannot draw, a colour-engine grade, an overlay look). Re-evaluate the mode here
+    // as well: the structural path (updateTimeline) already does. When the mode is unchanged this
+    // is a cheap no-op, and when the compositor is already active the branch below forwards the
+    // timeline, so only the player→compositor transition is handled here.
+    if (!_compositorActive.value) refreshCompositorMode()
+    _activeClip.value = findClipAt(currentPosMs)
+    if (_compositorActive.value) {
+      compositor?.updateTimeline(timeline)
+      // The GPU compositor grades every layer from the timeline, so a new generation is
+      // enough — but ask for the redraw explicitly so a paused preview repaints as well.
+      compositor?.requestRender()
+      return
+    }
+    publishLookToBoundNodes(look)
+    val targetClipId = look?.clipId
+    val clip = targetClipId?.let { id -> currentTimeline.videoClips.find { it.id == id } } ?: _activeClip.value
+    val graphSig = PreviewFilterEffects.media3GraphSignature(clip, currentTimeline)
+    when {
+      // Same resident-node condition applyActiveLookToPlayers uses, from the same definition.
+      PreviewGraphDecision.needsResidentGradingInstall(boundMainGrading != null, lookFallbackActive) ->
+        applyActiveLookToPlayers(force = true, preferClipId = targetClipId)
+      PreviewEffectApplyPolicy.shouldRebuildGraph(lastMedia3GraphSignature, graphSig, force = false) ->
+        scheduleSpatialLook(preferClipId = targetClipId)
+      else -> requestPausedFrameRefresh()
+    }
+  }
+
+  /**
+   * Pushes the latest look values onto every resident ColorGrading node they apply to.
+   *
+   * A look published for a clip id grades that clip's node: the main-track node for a main
+   * clip, the overlay node for a PiP clip. Publishing the playhead clip instead was the bug
+   * that made Adjust / Video Quality edits on a selected-but-offscreen clip invisible.
+   */
+  private fun publishLookToBoundNodes(look: LivePreviewLook?) {
+    val tl = currentTimeline
+    val targetId = look?.clipId
+    if (targetId != null) {
+      val overlay = tl.overlayClips.find { it.id == targetId }
+      if (overlay != null) {
+        boundOverlayGrading[overlay.id]?.publishLive(gradingSnapshotFor(overlay))
+        return
+      }
+    }
+    val mainClip = targetId?.let { id -> tl.videoClips.find { it.id == id } } ?: _activeClip.value
+    publishLiveGrading(mainClip)
+  }
+
+  private fun gradingSnapshotFor(clip: VideoClip?): ColorGradingSnapshot = ColorGradingSnapshot.from(
+    clip.effectiveAdjustments(currentTimeline),
+    PreviewFilterEffects.effectiveFilter(clip, currentTimeline)
+  )
+
+  /**
+   * Repaints the held (paused) frame so a freshly published look is visible.
+   *
+   * Slider drags emit faster than the repaint rate. The throttle must therefore **coalesce**
+   * rather than drop: a trailing repaint is scheduled for the end of the current window so
+   * the slider's final value is always the one on screen.
+   */
+  private fun requestPausedFrameRefresh(force: Boolean = false) {
+    if (engineController.timelineSyncManager.isPlaying) return
+    val elapsed = SystemClock.elapsedRealtime() - lastPresentAtElapsedMs
+    if (force || elapsed >= PAUSED_REPAINT_INTERVAL_MS) {
+      presentCurrentFrame(rebindSurface = false, force = true)
+      return
+    }
+    if (pausedRepaintJob != null) return
+    pausedRepaintJob = scope.launch {
+      delay(PAUSED_REPAINT_INTERVAL_MS - elapsed)
+      pausedRepaintJob = null
+      presentCurrentFrame(rebindSurface = false, force = true)
+    }
+  }
+
+  private fun scheduleSpatialLook(preferClipId: String? = null) {
+    spatialLookJob?.cancel()
+    spatialLookJob = scope.launch {
+      delay(PreviewLookPolicy.LOOK_DEBOUNCE_MS)
+      if (!isActive) return@launch
+      val beforeGraph = lastMedia3GraphSignature
+      applyActiveLookToPlayers(force = false, preferClipId = preferClipId)
+      if (!engineController.timelineSyncManager.isPlaying) {
+        // force: the LUT / VFX rebuild has to repaint the held frame even when a previous
+        // repaint happened inside the throttle window, or the new look stays invisible.
+        presentCurrentFrame(rebindSurface = lastMedia3GraphSignature != beforeGraph, force = true)
+      }
+    }
+  }
+
+  private fun publishLiveGrading(clip: VideoClip?) {
+    boundMainGrading?.publishLive(gradingSnapshotFor(clip))
+  }
+
+  fun applyActiveLookToPlayers(force: Boolean = false, preferClipId: String? = null) {
+    // The compositor grades every layer itself, with the export shaders.
+    if (_compositorActive.value) {
+      compositor?.requestRender()
+      return
+    }
+    if (lookFallbackActive && SystemClock.elapsedRealtime() - lastLookFallbackAtElapsedMs > LOOK_FALLBACK_RETRY_MS) {
+      // One bounded retry per cooldown window: the device failed the graph once, but a new clip /
+      // LUT / effect may well be fine. Retrying per slider tick only swung setVideoEffects without
+      // ever restoring the look; never retrying made the effects disappear for the whole session.
+      lookFallbackActive = false
+    }
+    val preferred = preferClipId?.let { id -> currentTimeline.videoClips.find { it.id == id } }
+    val clip = preferred ?: _activeClip.value
+    val valueSig = PreviewFilterEffects.media3Signature(clip, currentTimeline)
+    val graphSig = PreviewFilterEffects.media3GraphSignature(clip, currentTimeline)
+    lastPreviewFilterSignature = PreviewFilterEffects.signature(clip, currentTimeline)
+    publishLiveGrading(clip)
+
+    // ONE definition of graphChanged, shared by the rebuild gate below and the install decision
+    // further down. It used to be recalculated at the install site from the graph signature alone,
+    // which dropped the missing-resident-node term: whenever "no grading node is resident" was the
+    // only reason to rebuild, the engine built a fresh effect list and then skipped
+    // setVideoEffects, so that recovery path could never actually recover.
+    //
+    // `lookFallbackActive` suppresses the missing-resident term on purpose: the device already
+    // reported it can only run the identity passthrough, and retrying on every slider tick just
+    // swings setVideoEffects without restoring the look.
+    val signatureChanged = PreviewEffectApplyPolicy.shouldRebuildGraph(lastMedia3GraphSignature, graphSig, force)
+    val graphChanged = PreviewGraphDecision.graphChanged(
+      previousGraphSignature = lastMedia3GraphSignature,
+      nextGraphSignature = graphSig,
+      residentGradingNode = boundMainGrading != null,
+      identityFallbackActive = lookFallbackActive,
+      force = force
+    )
+    if (!graphChanged) {
+      lastMedia3Signature = valueSig
+      applyOverlayLooks(force)
+      // The resident shader already has the new values; ExoPlayer still has to draw one more
+      // frame for them to be visible. Without this the whole call was a no-op while paused
+      // (refreshCurrentFrame / LUT taps updated uniforms nobody ever rendered again).
+      requestPausedFrameRefresh()
+      return
+    }
+
+    val lut = PreviewFilterEffects.lutLook(clip)
+    val lutBmp = if (clip != null && ColorEngineHost.isBypassed(clip.id)) {
+      null
+    } else {
+      lut?.first?.let { LutStripBaker.bitmapFor(context, it) }
+    }
+    val effects = PreviewFilterEffects.effectsFor(clip, currentTimeline, lutBmp, lut?.second ?: 1f)
+    // Publish onto the node that is ACTUALLY installed in the player's video graph.
+    //
+    // `effects` always contains a freshly built grading effect, but it only becomes the resident
+    // one once setVideoEffects succeeds. Recording it as [boundMainGrading] before that meant
+    // later slider ticks published onto an object no shader program was reading, while the real
+    // resident node kept its old snapshot — so the preview stopped reacting to Filters / Adjust /
+    // Video Quality after the first graph rebuild that did not actually apply.
+    // [boundMainGrading] is therefore assigned only in the APPLIED branch below.
+    //
+    // The matching half of that bug was the skipped install itself: the install check recalculated
+    // `graphChanged` from the graph signature alone, so "no grading node is resident" never reached
+    // it and the skip branch stayed sticky. Both stages now share one
+    // [PreviewGraphDecision.graphChanged] value, and the skip branch no longer records the signature
+    // while a node is missing.
+    val grading = boundMainGrading ?: effects.filterIsInstance<ColorGradingGlEffect>().firstOrNull()
+    grading?.publishLive(gradingSnapshotFor(clip))
+
+    val surfaceBound = PreviewVideoSurfaceRegistry.hasBoundSurface(player)
+    if (PreviewEffectApplyPolicy.shouldDeferLookApply(surfaceBound)) {
+      pendingMedia3Effects = effects
+      deferredLooksPending = true
+      scheduleDeferredLookFlush()
+      Log.i(
+        TAG,
+        "Deferring setVideoEffects until TextureView is bound (graph=$graphSig); " +
+          "auto-retry every ${PreviewDeferredFlushPolicy.RETRY_DELAY_MS}ms " +
+          "(attempt ${deferredFlushAttempts + 1}/${PreviewDeferredFlushPolicy.MAX_ATTEMPTS})"
+      )
+      applyOverlayLooks(force)
+      return
+    }
+    deferredLooksPending = false
+    deferredFlushAttempts = 0
+    deferredFlushJob?.cancel()
+    deferredFlushJob = null
+
+    // Stage 2 of the SAME decision: the `graphChanged` computed above is passed through unchanged,
+    // so the install decision can no longer disagree with the rebuild gate.
+    val decision = PreviewGraphDecision.outcomeFor(
+      graphChanged = graphChanged,
+      signatureChanged = signatureChanged,
+      residentGradingNode = boundMainGrading != null,
+      identityFallbackActive = lookFallbackActive,
+      newEffectCount = effects.size,
+      previousHadEffects = lastGoodMedia3Effects.isNotEmpty() || pendingMedia3Effects != null,
+      force = force
+    )
+    if (!decision.callSetVideoEffects) {
+      // Only record the signature when nothing is missing. Recording it while no grading node is
+      // resident is what made the state sticky: the next tick saw an "unchanged" graph and skipped
+      // the install again, forever.
+      if (!PreviewGraphDecision.needsResidentGradingInstall(boundMainGrading != null, lookFallbackActive)) {
+        lastMedia3GraphSignature = graphSig
+      }
+      lastMedia3Signature = valueSig
+      Log.d(TAG, "Skipped setVideoEffects (graph=$graphSig reason=${decision.reason})")
+      applyOverlayLooks(force)
+      requestPausedFrameRefresh()
+      return
+    }
+
+    val playWhenReady = try { player.playWhenReady } catch (_: Throwable) { false }
+    val volume = try { player.volume } catch (_: Throwable) { 1f }
+    applyingEffects = true
+    pendingMedia3Effects = effects
+    val result = try {
+      Media3EffectPipeline.applyRealtimeEffectsDetailed(player, effects)
+    } finally {
+      applyingEffects = false
+    }
+    when (result) {
+      Media3EffectPipeline.ApplyResult.APPLIED -> {
+        lastMedia3GraphSignature = graphSig
+        lastMedia3Signature = valueSig
+        // The graph is live: this instance is now the resident grading node.
+        boundMainGrading = effects.filterIsInstance<ColorGradingGlEffect>().firstOrNull() ?: grading
+        lookFallbackActive = false
+        PreviewVideoSurfaceRegistry.rebindCurrent(player)
+        PreviewVideoSurfaceRegistry.rebindCurrent(player, PreviewEffectApplyPolicy.SURFACE_REBIND_DELAY_MS)
+        restorePlaybackAfterGraphChange(playWhenReady, volume)
+        // setVideoEffects tears the renderer down and rebuilds it; an exact seek issued during
+        // that window is swallowed. Re-present the held frame AFTER the delayed surface rebind so
+        // a paused preview can never stay on the pre-effect picture ("effect tap did nothing").
+        scope.launch {
+          delay(PreviewEffectApplyPolicy.SURFACE_REBIND_DELAY_MS + 120L)
+          presentCurrentFrame(rebindSurface = false, force = true)
+        }
+        Log.i(
+          TAG,
+          "Rebuilt Media3 preview graph lut=${lut?.first ?: "none"} effects=${effects.size} force=$force playWhenReady=$playWhenReady"
+        )
+      }
+      Media3EffectPipeline.ApplyResult.FALLBACK_IDENTITY -> {
+        pendingMedia3Effects = Media3EffectPipeline.identityEffects()
+        lastMedia3GraphSignature = graphSig
+        lastMedia3Signature = valueSig
+        boundMainGrading = null
+        lastLookFallbackAtElapsedMs = SystemClock.elapsedRealtime()
+        // The device cannot run the grading graph. Stop trying to rebuild it on every slider
+        // tick: that only swings setVideoEffects repeatedly and never restores the look.
+        lookFallbackActive = true
+        PreviewVideoSurfaceRegistry.rebindCurrent(player)
+        PreviewVideoSurfaceRegistry.rebindCurrent(player, PreviewEffectApplyPolicy.SURFACE_REBIND_DELAY_MS)
+        restorePlaybackAfterGraphChange(playWhenReady, volume)
+        // Identity passthrough means the player path can never show this look. Hand look
+        // rendering to the GPU compositor (the pipeline the export runs): on devices with a
+        // broken Media3 effects stack this is the difference between "filters do nothing" and
+        // a live preview. refreshCompositorMode treats lookFallbackActive as requiring
+        // composition, so the very first failed tap now ends on a visible, graded frame.
+        refreshCompositorMode()
+        if (_compositorActive.value) {
+          compositor?.requestRender()
+          _playerError.value = null
+        } else {
+          _playerError.value = "Preview effect failed to initialize. Showing unfiltered video."
+        }
+        Log.e(TAG, "Preview look fell back to identity passthrough (requested ${effects.size} effects; compositor takeover=${_compositorActive.value})")
+      }
+      Media3EffectPipeline.ApplyResult.FAILED -> {
+        pendingMedia3Effects = null
+        // Nothing was installed: drop the resident node so the next look change retries the
+        // graph build instead of publishing into a dead object.
+        boundMainGrading = null
+        _playerError.value = "Preview look could not be applied (${effects.size} effects). Recreating the player."
+        Log.e(TAG, "Preview look apply failed; recreating player (lastGood=${lastGoodMedia3Effects.size})")
+        if (!recreatingPlayer) recreatePreviewPlayer("setVideoEffects_failed")
+      }
+    }
+    applyOverlayLooks(force)
+  }
+
+  /**
+   * Re-binds the TextureView and, when paused, seeks the current source frame so ExoPlayer
+   * presents a picture. Required after surface recreation (editor reopen) and after
+   * setVideoEffects, both of which otherwise leave a black or frozen preview.
+   */
+  fun presentCurrentFrame(rebindSurface: Boolean = true, force: Boolean = false) {
+    if (isTrimPreviewMode) return
+    if (_compositorActive.value) {
+      compositor?.requestRender()
+      return
+    }
+    if (rebindSurface) PreviewVideoSurfaceRegistry.rebindCurrent(player)
+    if (engineController.timelineSyncManager.isPlaying) return
+    val now = SystemClock.elapsedRealtime()
+    if (!force && now - lastPresentAtElapsedMs < PAUSED_REPAINT_INTERVAL_MS && lastPresentPosMs == currentPosMs) return
+    lastPresentAtElapsedMs = now
+    lastPresentPosMs = currentPosMs
+    val clip = _activeClip.value ?: findClipAt(currentPosMs) ?: return
+    // Probe the SAME uri playback resolves (proxy / relinked), not the raw project uri: a
+    // proxy-served clip used to fail the raw probe and the repaint was silently skipped, so
+    // setVideoEffects succeeded while the paused preview kept the old picture.
+    val playableUri = MediaPlayableUri.resolvePlayableString(
+      context,
+      proxyEngine?.getProxyUri(clip) ?: clip.uri
+    )
+    if (!isPlayableInPlayer(playableUri)) {
+      // Silent-skip made a rejected repaint look like a swallowed look edit. Name the gate once
+      // per second at most, so the log answers "why did my filter not show up" without spamming.
+      val nowMs = SystemClock.elapsedRealtime()
+      if (nowMs - lastPresentProbeRejectLogAtMs > 1_000L) {
+        lastPresentProbeRejectLogAtMs = nowMs
+        Log.w(TAG, "Paused repaint skipped: source not playable for clip=${clip.id} uri=$playableUri")
+      }
+      return
+    }
+    try {
+      engineController.playbackController.seekTo(
+        clip.timelineToSourceMs(currentPosMs),
+        resumeAfter = false,
+        exact = true
+      )
+    } catch (t: Throwable) {
+      Log.w(TAG, "presentCurrentFrame seek failed", t)
+    }
+  }
+
+  /**
+   * Re-initializes decoder output, Media3 looks and the current frame after the editor
+   * is opened on an existing project. Does not reset the playback clock or mute state.
+   */
+  fun prepareForEditorEntry() {
+    // Editor re-entry after an export lifts the suspension BEFORE the mode refresh: the
+    // compositor must be allowed to re-activate for projects that need it.
+    previewSuspendedForExport = false
+    lastMedia3Signature = null
+    lastMedia3GraphSignature = null
+    lastPreviewFilterSignature = null
+    boundMainGrading = null
+    lookFallbackActive = false
+    try {
+      if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+        player.prepare()
+      }
+    } catch (t: Throwable) {
+      Log.e(TAG, "prepareForEditorEntry prepare failed", t)
+    }
+    PreviewVideoSurfaceRegistry.attachRememberedPrimary(player)
+    PreviewVideoSurfaceRegistry.rebindCurrent(player)
+    // Re-evaluate the compositor mode first: a project that needs the GPU preview re-enters it
+    // here, and applyActiveLookToPlayers below becomes a cheap requestRender on that path.
+    refreshCompositorMode()
+    // Do not force setVideoEffects before a TextureView is bound: that is the
+    // reopen path that left a black preview with silent source audio.
+    applyActiveLookToPlayers(force = false)
+    presentCurrentFrame()
+  }
+
+  private fun flushDeferredLooks(reason: String) {
+    if (!deferredLooksPending) return
+    if (!PreviewVideoSurfaceRegistry.hasBoundSurface(player)) return
+    deferredLooksPending = false
+    deferredFlushAttempts = 0
+    deferredFlushJob?.cancel()
+    deferredFlushJob = null
+    Log.i(TAG, "Flushing deferred preview looks reason=$reason")
+    applyActiveLookToPlayers(force = true)
+  }
+
+  /**
+   * Bounded auto-retry for a deferred look apply.
+   *
+   * The parked graph used to be flushed only by a NEW surface-bind event or by play(). A paused
+   * editor whose bound TextureView transiently reported isAvailable == false (every tool-panel
+   * transition does that) never produced either event — the registry still holds the same view, so
+   * re-binding is a no-op — and every Filters / Adjust / Color-Grading tick re-deferred forever.
+   * The retry below flushes the parked graph the moment the surface is available again, so a look
+   * edit reaches the GPU without waiting for another tool to switch the renderer.
+   */
+  private fun scheduleDeferredLookFlush() {
+    deferredFlushJob?.cancel()
+    deferredFlushJob = scope.launch {
+      while (isActive && deferredLooksPending) {
+        delay(PreviewDeferredFlushPolicy.RETRY_DELAY_MS)
+        if (!isActive || !deferredLooksPending) return@launch
+        val bound = PreviewVideoSurfaceRegistry.hasBoundSurface(player)
+        if (bound) {
+          Log.i(TAG, "Deferred look surface re-available after ${deferredFlushAttempts + 1} checks; flushing")
+          flushDeferredLooks("deferredRetry")
+          return@launch
+        }
+        deferredFlushAttempts++
+        if (!PreviewDeferredFlushPolicy.shouldRetry(deferredFlushAttempts, surfaceBound = false)) {
+          Log.w(
+            TAG,
+            "Deferred look gave up after $deferredFlushAttempts checks " +
+              "(${PreviewDeferredFlushPolicy.maxWindowMs}ms); the next look edit restarts the retry"
+          )
+          deferredLooksPending = false
+          deferredFlushAttempts = 0
+          deferredFlushJob = null
+          return@launch
+        }
+      }
+    }
+  }
+
+  private fun commitPendingMedia3Effects(reason: String) {
+    val pending = pendingMedia3Effects ?: return
+    lastGoodMedia3Effects = pending
+    pendingMedia3Effects = null
+    Log.d(TAG, "Committed preview Media3 effects count=${pending.size} reason=$reason")
+  }
+
+  private fun restorePlaybackAfterGraphChange(playWhenReady: Boolean, volume: Float) {
+    try {
+      if (player.volume != volume) player.volume = volume
+      if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+        Log.i(TAG, "Preview player returned to IDLE after setVideoEffects; preparing")
+        player.prepare()
+      }
+      if (playWhenReady && !player.playWhenReady) player.playWhenReady = true
+      if (playWhenReady) player.play()
+    } catch (t: Throwable) {
+      Log.e(TAG, "Failed to restore playback after preview graph change", t)
+    }
+  }
+
+  private fun recoverPreviewPipelineIfNeeded() {
+    try {
+      val error = player.playerError
+      val state = player.playbackState
+      if (error == null && state != Player.STATE_IDLE && state != Player.STATE_ENDED) return
+      Log.e(
+        TAG,
+        "Preview pipeline not ready on play (state=$state error=${error?.errorCodeName}: ${error?.message}); recovering"
+      )
+      val fallback = PreviewEffectApplyPolicy.recoveryEffects(lastGoodMedia3Effects)
+      applyingEffects = true
+      try {
+        val result = Media3EffectPipeline.applyRealtimeEffectsDetailed(player, fallback)
+        if (result == Media3EffectPipeline.ApplyResult.FAILED && !recreatingPlayer) {
+          recreatePreviewPlayer("pipeline_not_ready")
+          return
+        }
+        if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+          player.prepare()
+        }
+        PreviewVideoSurfaceRegistry.rebindCurrent(player)
+      } finally {
+        applyingEffects = false
+      }
+    } catch (t: Throwable) {
+      Log.e(TAG, "Preview pipeline recovery failed", t)
+    }
+  }
+
+  private fun recoverFromPreviewEffectError(error: PlaybackException) {
+    val processingFailure = PreviewEffectApplyPolicy.isVideoProcessingFailure(error)
+    if (!processingFailure && !applyingEffects) return
+    val shouldResume = engineController.timelineSyncManager.isPlaying
+    val volume = try { player.volume } catch (_: Throwable) { 1f }
+    applyingEffects = true
+    try {
+      pendingMedia3Effects = null
+      val fallback = PreviewEffectApplyPolicy.recoveryEffects(lastGoodMedia3Effects)
+      val result = Media3EffectPipeline.applyRealtimeEffectsDetailed(player, fallback)
+      if (result != Media3EffectPipeline.ApplyResult.FAILED && player.playerError == null) {
+        lastMedia3GraphSignature = null
+        boundMainGrading = fallback.filterIsInstance<ColorGradingGlEffect>().firstOrNull()
+        PreviewVideoSurfaceRegistry.rebindCurrent(player)
+        PreviewVideoSurfaceRegistry.rebindCurrent(player, PreviewEffectApplyPolicy.SURFACE_REBIND_DELAY_MS)
+        restorePlaybackAfterGraphChange(shouldResume, volume)
+        if (!shouldResume) presentCurrentFrame(rebindSurface = false)
+        // The SAME takeover the synchronous identity-fallback branch performs
+        // (applyActiveLookToPlayers FALLBACK_IDENTITY). `setVideoEffects` returns before Media3's
+        // GL pipeline is up, so a device whose frame processor cannot run the look graph reports
+        // the failure HERE — asynchronously, after "APPLIED" was already recorded. Without the
+        // takeover the engine rolled back to the identity passthrough on EVERY look tap: filters
+        // stayed invisible until Chroma Key / Effects activated the compositor, which is exactly
+        // the "filter preview only works after switching to another tool" report. With it, the
+        // first failed tap ends on the compositor — the one renderer that draws every look with
+        // the export shaders — and the failure stays reported instead of silently showing an
+        // unfiltered frame.
+        val takeover = PreviewPipelinePolicy.actionAfterProcessingFailure(
+          isVideoProcessingFailure = processingFailure,
+          compositorAlreadyActive = _compositorActive.value,
+          compositorPreviouslyFailed = compositorFailed
+        )
+        if (takeover == PreviewPipelinePolicy.ProcessingFailureAction.COMPOSITOR_TAKEOVER) {
+          lookFallbackActive = true
+          lastLookFallbackAtElapsedMs = SystemClock.elapsedRealtime()
+          refreshCompositorMode()
+        }
+        if (_compositorActive.value) {
+          // The compositor grades every layer straight from the timeline, so the look that was
+          // being installed is already on screen on the next compositor frame — paused or not.
+          compositor?.requestRender()
+          _playerError.value = null
+        } else {
+          _playerError.value = if (result == Media3EffectPipeline.ApplyResult.FALLBACK_IDENTITY) {
+            "Preview GPU look failed (${error.errorCodeName}). Showing unfiltered video."
+          } else {
+            "Preview GPU look failed (${error.errorCodeName}). Last valid preview was kept."
+          }
+        }
+        Log.e(
+          TAG,
+          "Rolled back preview effects after ${error.errorCodeName} result=$result " +
+            "count=${fallback.size} compositorTakeover=${_compositorActive.value}"
+        )
+        return
+      }
+    } catch (t: Throwable) {
+      Log.e(TAG, "Preview effect rollback failed", t)
+    } finally {
+      applyingEffects = false
+    }
+    if (PreviewPipelinePolicy.shouldRecreatePlayer(error, applyFailed = true)) {
+      recreatePreviewPlayer("effect_error_${error.errorCodeName}")
+    }
+  }
+
+  /**
+   * Releases overlay players, both preview compositors, the main ExoPlayer / MediaCodec chain,
+   * and re-binds the remembered TextureView to the new instance.
+   */
+  fun resetPlaybackSession() {
+    spatialLookJob?.cancel()
+    spatialLookJob = null
+    pausedRepaintJob?.cancel()
+    pausedRepaintJob = null
+    deferredFlushJob?.cancel()
+    deferredFlushJob = null
+    deferredFlushAttempts = 0
+    lookFallbackActive = false
+    try { pause() } catch (_: Throwable) {}
+    teardownCompositor()
+    releaseOverlayPlayers()
+    previewCompositor.release()
+    audioTrackPlayers.values.forEach { p ->
+      try { p.stop(); p.release() } catch (_: Exception) {}
+    }
+    audioTrackPlayers.clear()
+    audioLoadedUris.clear()
+    secondaryCorrectionAtMs.clear()
+    lastOverlayGraphSignatures.clear()
+    lastOverlayFilterSignatures.clear()
+    boundOverlayGrading.clear()
+    lastMedia3Signature = null
+    lastMedia3GraphSignature = null
+    lastPreviewFilterSignature = null
+    pendingMedia3Effects = null
+    lastGoodMedia3Effects = emptyList()
+    boundMainGrading = null
+    applyingEffects = false
+    deferredLooksPending = false
+    _playerError.value = null
+    _overlayPlayerIds.value = emptySet()
+    currentPosMs = 0L
+    _currentPositionMs.value = 0L
+    currentTimeline = Timeline()
+    _activeClip.value = null
+    val previous = try { player } catch (_: Throwable) { null }
+    previous?.let { old ->
+      try { old.removeListener(previewPlayerListener) } catch (_: Throwable) {}
+      PreviewVideoSurfaceRegistry.forget(old)
+    }
+    engineController.resetPlaybackSession()
+    attachPreviewPlayerListener()
+    _playerGeneration.value = _playerGeneration.value + 1
+    PreviewVideoSurfaceRegistry.attachRememberedPrimary(player)
+    Log.i(TAG, "Preview playback session reset generation=${_playerGeneration.value}")
+  }
+
+  private fun recreatePreviewPlayer(reason: String) {
+    if (recreatingPlayer) {
+      Log.e(TAG, "Already recreating preview player; skipping $reason")
+      return
+    }
+    recreatingPlayer = true
+    Log.e(TAG, "Recreating preview player ($reason)")
+    val shouldResume = engineController.timelineSyncManager.isPlaying
+    val pos = currentPosMs
+    try {
+    resetPlaybackSession()
+    try {
+      if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+        player.prepare()
+      }
+    } catch (t: Throwable) {
+      Log.e(TAG, "prepare after recreate failed", t)
+    }
+    applyActiveLookToPlayers(force = true)
+    engineController.updateTimeline(currentTimeline)
+    engineController.seekTo(pos)
+    if (shouldResume) {
+      try { play(pos) } catch (t: Throwable) { Log.e(TAG, "resume after recreate failed", t) }
+    } else {
+      presentCurrentFrame()
+    }
+    } finally {
+      recreatingPlayer = false
+    }
+  }
+
+  private fun applyOverlayLooks(force: Boolean = false) {
+    if (_compositorActive.value) return
+    val activeIds = currentTimeline.overlayClips.map { it.id }.toSet()
+    lastOverlayFilterSignatures.keys.toList().filter { it !in activeIds }.forEach { lastOverlayFilterSignatures.remove(it) }
+    lastOverlayGraphSignatures.keys.toList().filter { it !in activeIds }.forEach { lastOverlayGraphSignatures.remove(it) }
+    boundOverlayGrading.keys.toList().filter { it !in activeIds }.forEach { boundOverlayGrading.remove(it) }
+    for (overlay in currentTimeline.overlayClips) {
+      val p = overlayPlayers[overlay.id] ?: continue
+      val valueSig = PreviewFilterEffects.media3Signature(overlay, currentTimeline)
+      val graphSig = PreviewFilterEffects.media3GraphSignature(overlay, currentTimeline)
+      val snapshot = ColorGradingSnapshot.from(
+        overlay.effectiveAdjustments(currentTimeline),
+        PreviewFilterEffects.effectiveFilter(overlay, currentTimeline)
+      )
+      boundOverlayGrading[overlay.id]?.publishLive(snapshot)
+      // Same ONE decision as the main path: the resident-node term must reach the install check too.
+      // The old skip-check tested `boundOverlayGrading[id] != null` while the install check below
+      // tested only the signature, so an overlay with no resident node built a fresh effect list and
+      // then skipped the install.
+      val overlaySignatureChanged = lastOverlayGraphSignatures[overlay.id] != graphSig
+      // graphChangedOrForced, not graphChanged: applyOverlayLooks has always rebuilt every overlay
+      // graph on a forced call (`!force && signatureEqual && resident` was the only skip), which
+      // flushDeferredLooks and recreatePreviewPlayer depend on.
+      val overlayGraphChanged = PreviewGraphDecision.graphChangedOrForced(
+        previousGraphSignature = lastOverlayGraphSignatures[overlay.id],
+        nextGraphSignature = graphSig,
+        residentGradingNode = boundOverlayGrading[overlay.id] != null,
+        force = force
+      )
+      if (!overlayGraphChanged) {
+        lastOverlayFilterSignatures[overlay.id] = valueSig
+        continue
+      }
+      val lut = PreviewFilterEffects.lutLook(overlay)
+      val lutBmp = lut?.first?.let { LutStripBaker.bitmapFor(context, it) }
+      val effects = PreviewFilterEffects.effectsFor(overlay, currentTimeline, lutBmp, lut?.second ?: 1f)
+      val grading = effects.filterIsInstance<ColorGradingGlEffect>().firstOrNull()
+      grading?.publishLive(snapshot)
+      val previousHad = lastOverlayGraphSignatures[overlay.id] != null
+      val overlayDecision = PreviewGraphDecision.outcomeFor(
+        graphChanged = overlayGraphChanged,
+        signatureChanged = overlaySignatureChanged,
+        residentGradingNode = boundOverlayGrading[overlay.id] != null,
+        newEffectCount = effects.size,
+        previousHadEffects = previousHad,
+        force = force
+      )
+      if (!overlayDecision.callSetVideoEffects) {
+        // Only record the signature when a node is actually resident. Recording it while none is
+        // made the state sticky: the next tick saw an unchanged graph and skipped again.
+        if (boundOverlayGrading[overlay.id] != null) {
+          lastOverlayGraphSignatures[overlay.id] = graphSig
+        }
+        lastOverlayFilterSignatures[overlay.id] = valueSig
+        continue
+      }
+      val playWhenReady = try { p.playWhenReady } catch (_: Throwable) { false }
+      val volume = try { p.volume } catch (_: Throwable) { 1f }
+      applyingEffects = true
+      val accepted = try {
+        Media3EffectPipeline.applyRealtimeEffects(p, effects)
+      } finally {
+        applyingEffects = false
+      }
+      if (accepted) {
+        // The graph is live: THIS instance is now the resident overlay grading node. Recording it
+        // before the install (as the code used to) meant every later publishLive wrote uniforms
+        // into an object no shader program was reading, while the resident node kept its old look.
+        if (grading != null) boundOverlayGrading[overlay.id] = grading else boundOverlayGrading.remove(overlay.id)
+        lastOverlayGraphSignatures[overlay.id] = graphSig
+        lastOverlayFilterSignatures[overlay.id] = valueSig
+        PreviewVideoSurfaceRegistry.rebindCurrent(p)
+        PreviewVideoSurfaceRegistry.rebindCurrent(p, PreviewEffectApplyPolicy.SURFACE_REBIND_DELAY_MS)
+        try {
+          if (p.volume != volume) p.volume = volume
+          if (playWhenReady) p.playWhenReady = true
+        } catch (t: Throwable) {
+          Log.e(TAG, "Failed to restore overlay playback after look apply", t)
+        }
+      } else {
+        // Nothing was installed: drop whatever was resident so the next look change retries the
+        // graph build instead of publishing into a dead object, and leave the signature unrecorded.
+        boundOverlayGrading.remove(overlay.id)
+        Log.e(TAG, "Overlay look apply failed for ${overlay.id} (${effects.size} effects)")
+      }
+    }
+  }
+
+  fun getOverlayPlayer(clipId: String): ExoPlayer? {
+    if (!PreviewCompositorPolicy.shouldAllocateOverlayExoPlayer()) return null
+    return try { overlayPlayers[clipId] } catch (_: Exception) { null }
+  }
+
+  fun bindOverlaySurface(clipId: String, view: android.view.TextureView) {
+    previewCompositor.bindOverlaySurface(clipId, view)
+  }
+
+  /**
+   * Decides whether a secondary (overlay/audio) player must be re-seeked while the timeline is playing.
+   * A player that is still BUFFERING/IDLE reports a stale currentPosition (often 0), so comparing it with
+   * the source position would issue a new seek on every sync tick (seek storm -> repeated audio "tuk tuk").
+   * The initial seek is already issued when playWhenReady is switched on.
+   */
+  private fun needsDriftReseek(playerId: String, p: ExoPlayer, sourceMs: Long): Boolean {
+    val state = try { p.playbackState } catch (_: Exception) { return false }
+    if (state == Player.STATE_BUFFERING || state == Player.STATE_IDLE) return false
+    val playing = try { p.isPlaying } catch (_: Exception) { return false }
+    val playerPos = try { p.currentPosition } catch (_: Exception) { return false }
+    // No recorded correction yet: treat it as "long ago" so the cooldown check passes.
+    // (The old Long.MIN_VALUE sentinel overflowed into a negative "since", defeating the check.)
+    val lastCorrection = secondaryCorrectionAtMs[playerId]
+    val since = if (lastCorrection == null) Long.MAX_VALUE else SystemClock.elapsedRealtime() - lastCorrection
+    return PlaybackSyncPolicy.shouldCorrectSourceDrift(playerPos, sourceMs, playing, since)
+  }
+
+  /**
+   * True when a secondary player that already reached its source end has to be restarted.
+   * ExoPlayer keeps `playWhenReady = true` and `isPlaying = false` in STATE_ENDED, so the
+   * old code neither seeked nor resumed it: audio / PIP stayed silent for the rest of the
+   * session once a source had played through (second pass, or a seek back into the clip).
+   */
+  private fun needsRestartFromEnd(p: ExoPlayer): Boolean =
+    try { p.playbackState == Player.STATE_ENDED } catch (_: Exception) { false }
+
+  /** Exact seek so overlay and audio players stay on the CTI instead of the previous keyframe. */
+  private fun seekSecondaryExact(playerId: String, p: ExoPlayer, sourceMs: Long) {
+    try {
+      p.setSeekParameters(SeekParameters.EXACT)
+      p.seekTo(sourceMs.coerceAtLeast(0L))
+      secondaryCorrectionAtMs[playerId] = SystemClock.elapsedRealtime()
+    } catch (e: Exception) {
+      Log.w(TAG, "Secondary seek failed", e)
+    }
+  }
+
+  /** Paused scrub position: skip the seek when the player is already on (nearly) the requested frame. */
+  private fun needsPausedSeek(p: ExoPlayer, sourceMs: Long): Boolean {
+    val playerPos = try { p.currentPosition } catch (_: Exception) { return true }
+    return kotlin.math.abs(playerPos - sourceMs) > PAUSED_SEEK_EPSILON_MS
+  }
+
+  fun syncOverlayPlayers(posMs: Long) {
+    if (isTrimPreviewMode) return
+    if (previewSuspendedForExport) return
+    if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) return
+    try {
+      // Default path: one clock, no overlay ExoPlayer. The GPU compositor (beta) is the exception
+      // and keeps audio-only players for audible overlays.
+      if (!_compositorActive.value && !PreviewCompositorPolicy.shouldAllocateOverlayExoPlayer()) {
+        releaseOverlayPlayers()
+        val fps = currentTimeline.videoClips.firstOrNull()?.frameRate?.toInt()?.takeIf { it > 0 } ?: 30
+        previewCompositor.sync(currentTimeline, posMs, fps)
+        _overlayPlayerIds.value = previewCompositor.overlaySurfaceIds.value
+        return
+      }
+      // Players exist only around the playhead. In compositor mode they only carry the overlay's
+      // audio (the picture is decoded by the compositor), so silent overlays get none.
+      val compositing = _compositorActive.value
+      val activeOverlays = currentTimeline.overlayClips.filter {
+        it.isVideo && !it.isHidden &&
+          PreviewLayerPlanner.inWindow(it.timelineStartMs, it.durationMs, posMs, PreviewLayerPlanner.PLAYER_PREROLL_MS) &&
+          (!compositing || PreviewMixPolicy.clipGain(it, currentTimeline, TrackType.OVERLAY) > 0f) &&
+          isPlayableInPlayer(it.uri)
+      }
+      val activeIds = activeOverlays.map { it.id }.toSet()
+      overlayPlayers.keys.toList().filter { it !in activeIds }.forEach { id ->
+        overlayPlayers.remove(id)?.let { p -> try { p.stop(); p.clearVideoSurface(); p.release() } catch (_: Exception) {} }
+        overlayLoadedUris.remove(id)
+        // The resident grading node lived inside the released player's video graph. Keeping it (and
+        // its recorded graph signature) meant that when the overlay scrolled back into the window a
+        // fresh player was created with no effects, while applyOverlayLooks saw an "unchanged" graph
+        // with a resident node and skipped the install - the overlay came back unfiltered and every
+        // later publishLive wrote into the dead instance.
+        boundOverlayGrading.remove(id)
+        lastOverlayGraphSignatures.remove(id)
+        lastOverlayFilterSignatures.remove(id)
+      }
+      for (overlay in activeOverlays) {
+        val effectiveUri = proxyEngine?.getProxyUri(overlay) ?: overlay.uri
+        var p = overlayPlayers[overlay.id]
+        if (p == null) {
+          p = try {
+            ExoPlayer.Builder(context.applicationContext, DefaultRenderersFactory(context.applicationContext).setEnableDecoderFallback(true))
+              .setLoadControl(DefaultLoadControl.Builder().setBufferDurationsMs(500, 5000, 250, 500).build())
+              .setSeekParameters(SeekParameters.EXACT).build().apply { repeatMode = Player.REPEAT_MODE_OFF }
+          } catch (e: Exception) {
+            Log.w(TAG, "Overlay player creation failed", e); continue
+          }
+          if (compositing) setVideoTrackDisabled(p, true)
+          overlayPlayers[overlay.id] = p
+        }
+        if (overlayLoadedUris[overlay.id] != effectiveUri || p.mediaItemCount == 0 || p.playbackState == Player.STATE_IDLE) {
+          try {
+            p.setMediaItem(MediaItem.fromUri(MediaPlayableUri.toExoPlayerUri(context, effectiveUri)))
+            p.prepare()
+            overlayLoadedUris[overlay.id] = effectiveUri
+          } catch (e: Exception) {
+            Log.w(TAG, "Overlay prepare failed", e)
+          }
+        }
+        try {
+          p.playbackParameters = androidx.media3.common.PlaybackParameters(overlay.speed.coerceAtLeast(0.01f))
+          // Track mute / solo plus the volume envelope, same rule as the export mix.
+          val rel = (posMs - overlay.timelineStartMs).coerceAtLeast(0L)
+          p.volume = PreviewMixPolicy.clipGainAt(overlay, currentTimeline, TrackType.OVERLAY, rel)
+          val active = posMs >= overlay.timelineStartMs && posMs < overlay.timelineStartMs + overlay.durationMs
+          val source = overlay.timelineToSourceMs(posMs)
+          if (active && engineController.timelineSyncManager.isPlaying) {
+            val isPlayWhenReady = try { p.playWhenReady } catch (_: Exception) { false }
+            if (!isPlayWhenReady || needsRestartFromEnd(p)) {
+              seekSecondaryExact(overlay.id, p, source)
+              p.playWhenReady = true
+            } else if (needsDriftReseek(overlay.id, p, source)) {
+              seekSecondaryExact(overlay.id, p, source)
+            }
+          } else {
+            val isPlayWhenReady = try { p.playWhenReady } catch (_: Exception) { false }
+            if (isPlayWhenReady) {
+              p.playWhenReady = false
+            }
+            if (!engineController.timelineSyncManager.isPlaying) {
+              val pausedTarget = source.coerceAtLeast(0L)
+              if (needsPausedSeek(p, pausedTarget)) seekSecondaryExact(overlay.id, p, pausedTarget)
+            }
+          }
+        } catch (e: Exception) {
+          Log.w(TAG, "Overlay sync error", e)
+        }
+      }
+      applyOverlayLooks()
+      _overlayPlayerIds.value = if (compositing) emptySet() else overlayPlayers.keys.toSet()
+    } catch (e: Exception) {
+      Log.w(TAG, "syncOverlayPlayers error", e)
+    }
+  }
+
+  fun syncAudioTrackPlayers(posMs: Long) {
+    if (isTrimPreviewMode) return
+    if (previewSuspendedForExport) return
+    if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) return
+    try {
+      val hasSolo = currentTimeline.audioClips.any { it.isSolo }
+      // Same gate as AudioExportProcessor.collectAudioTracks() / PreviewMixPolicy:
+      // track mute/solo plus clip mute/hide. Track-level hide still leaves audio audible.
+      val activeAudios = currentTimeline.audioClips.filter {
+        PreviewMixPolicy.audioClipGain(it, currentTimeline, hasSolo) > 0f &&
+          isPlayableInPlayer(it.uri)
+      }
+
+      // Effect baking runs for the whole project so it is ready in time; players only near the playhead.
+      for (audio in activeAudios) {
+        if (audio.audioEffects.hasActiveEffects() && AudioEffectsPreviewCache.cachedUri(audio) == null) {
+          AudioEffectsPreviewCache.request(context, audio, scope) {
+            audioLoadedUris.remove(audio.id)
+            syncAudioTrackPlayers(currentPosMs)
+          }
+        }
+      }
+      val windowIds = PreviewLayerPlanner.audioIdsInWindow(currentTimeline, posMs)
+      val windowAudios = activeAudios.filter { it.id in windowIds }
+      val activeIds = windowAudios.map { it.id }.toSet()
+      audioTrackPlayers.keys.toList().filter { it !in activeIds }.forEach { id ->
+        audioTrackPlayers.remove(id)?.let { p -> try { p.stop(); p.release() } catch (_: Exception) {} }
+        audioLoadedUris.remove(id)
+      }
+
+      for (audio in windowAudios) {
+        val effectiveUri = AudioEffectsPreviewCache.cachedUri(audio) ?: audio.uri
+        var p = audioTrackPlayers[audio.id]
+        if (p == null) {
+          p = try {
+            ExoPlayer.Builder(context.applicationContext, DefaultRenderersFactory(context.applicationContext).setEnableDecoderFallback(true))
+              .setLoadControl(DefaultLoadControl.Builder().setBufferDurationsMs(1000, 6000, 400, 800).build())
+              .setSeekParameters(SeekParameters.EXACT).build().apply { repeatMode = Player.REPEAT_MODE_OFF }
+          } catch (e: Exception) {
+            Log.w(TAG, "Audio player creation failed", e); continue
+          }
+          audioTrackPlayers[audio.id] = p
+        }
+        if (audioLoadedUris[audio.id] != effectiveUri || p.mediaItemCount == 0 || p.playbackState == Player.STATE_IDLE) {
+          try {
+            p.setMediaItem(MediaItem.fromUri(MediaPlayableUri.toExoPlayerUri(context, effectiveUri)))
+            p.prepare()
+            audioLoadedUris[audio.id] = effectiveUri
+          } catch (e: Exception) {
+            Log.w(TAG, "Audio player prepare failed", e)
+          }
+        }
+        try {
+          p.playbackParameters = androidx.media3.common.PlaybackParameters(audio.speed.coerceAtLeast(0.01f))
+          val rel = (posMs - audio.timelineStartMs).coerceAtLeast(0L)
+          // Envelope replaces the static slider; gainDb is the same trim the export mix applies.
+          var calculatedVol = com.example.engine.KeyframeInterpolator.interpolateVolume(
+            audio.keyframes, rel, audio.volume
+          )
+          calculatedVol *= 10f.pow(audio.gainDb / 20f)
+          calculatedVol = calculatedVol.coerceIn(0f, 2f)
+          if (audio.fadeInMs > 0L && rel < audio.fadeInMs) {
+            calculatedVol *= (rel.toFloat() / audio.fadeInMs.toFloat()).coerceIn(0f, 1f)
+          }
+          val timeFromEnd = (audio.durationMs - rel).coerceAtLeast(0L)
+          if (audio.fadeOutMs > 0L && timeFromEnd < audio.fadeOutMs) {
+            calculatedVol *= (timeFromEnd.toFloat() / audio.fadeOutMs.toFloat()).coerceIn(0f, 1f)
+          }
+          calculatedVol *= com.example.engine.audio.AutoDucking.gainAt(currentTimeline, audio, posMs)
+          p.volume = if (audio.isMuted) 0f else calculatedVol
+          val active = posMs >= audio.timelineStartMs && posMs < audio.timelineStartMs + audio.durationMs
+          val source = audio.timelineToSourceMs(posMs)
+          if (active && engineController.timelineSyncManager.isPlaying) {
+            val isPlayWhenReady = try { p.playWhenReady } catch (_: Exception) { false }
+            // A source that already played to its end must be seeked back, otherwise the
+            // second playback pass of the project (or a jump back into the clip) stayed silent.
+            if (!isPlayWhenReady || needsRestartFromEnd(p)) {
+              seekSecondaryExact(audio.id, p, source)
+              p.playWhenReady = true
+            } else if (needsDriftReseek(audio.id, p, source)) {
+              seekSecondaryExact(audio.id, p, source)
+            }
+          } else {
+            val isPlayWhenReady = try { p.playWhenReady } catch (_: Exception) { false }
+            if (isPlayWhenReady) {
+              p.playWhenReady = false
+            }
+            if (!engineController.timelineSyncManager.isPlaying) {
+              val pausedTarget = source.coerceAtLeast(0L)
+              if (needsPausedSeek(p, pausedTarget)) seekSecondaryExact(audio.id, p, pausedTarget)
+            }
+          }
+        } catch (e: Exception) {
+          Log.w(TAG, "Audio track sync error", e)
+        }
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "syncAudioTrackPlayers error", e)
+    }
+  }
+
+  fun updateTimeline(timeline: Timeline) {
+    currentTimeline = timeline
+    currentPosMs = currentPosMs.coerceIn(0L, timeline.totalDurationMs.coerceAtLeast(0L))
+    _currentPositionMs.value = currentPosMs
+    _activeClip.value = findClipAt(currentPosMs)
+    refreshCompositorMode()
+    applyActiveLookToPlayers()
+    engineController.updateTimeline(timeline)
+    applyMainVideoTrackMode()
+    syncOverlayPlayers(currentPosMs)
+    syncAudioTrackPlayers(currentPosMs)
+  }
+
+  fun startScrubbing() {
+    isScrubbingMode = true
+    wasPlayingBeforeScrub = _isPlaying.value
+    engineController.startScrubbing()
+  }
+
+  fun scrubTo(timelinePosMs: Long) {
+    if (!isScrubbingMode) startScrubbing()
+    val bounded = timelinePosMs.coerceIn(0L, currentTimeline.totalDurationMs.coerceAtLeast(0L))
+    currentPosMs = bounded
+    _currentPositionMs.value = bounded
+    _activeClip.value = findClipAt(bounded)
+    engineController.scrubTo(bounded)
+    syncOverlayPlayers(bounded)
+    syncAudioTrackPlayers(bounded)
+  }
+
+  fun stopScrubbing(finalPosMs: Long? = null) {
+    val target = finalPosMs ?: currentPosMs
+    isScrubbingMode = false
+    engineController.stopScrubbing(target)
+    _currentPositionMs.value = target
+    syncOverlayPlayers(target)
+    syncAudioTrackPlayers(target)
+    if (wasPlayingBeforeScrub) wasPlayingBeforeScrub = false
+  }
+
+  fun seekTo(timelinePosMs: Long) {
+    isScrubbingMode = false
+    val bounded = timelinePosMs.coerceIn(0L, currentTimeline.totalDurationMs.coerceAtLeast(0L))
+    currentPosMs = bounded
+    _currentPositionMs.value = bounded
+    _activeClip.value = findClipAt(bounded)
+    engineController.seekTo(bounded)
+    syncOverlayPlayers(bounded)
+    syncAudioTrackPlayers(bounded)
+  }
+
+  fun play(startPosMs: Long? = null) {
+    if (isTrimPreviewMode) { playTrimPreview(); return }
+    _playerError.value = null
+    val compositing = _compositorActive.value
+    if (!compositing) {
+      PreviewVideoSurfaceRegistry.attachRememberedPrimary(player)
+      PreviewVideoSurfaceRegistry.rebindCurrent(player)
+      flushDeferredLooks("play")
+    }
+    val needsReload = try {
+      player.mediaItemCount == 0 ||
+        player.playbackState == Player.STATE_IDLE ||
+        player.playerError != null
+    } catch (_: Throwable) {
+      true
+    }
+    if (needsReload) {
+      engineController.updateTimeline(currentTimeline)
+    }
+    if (compositing) applyMainVideoTrackMode() else recoverPreviewPipelineIfNeeded()
+    engineController.play(startPosMs)
+    val pos = startPosMs ?: currentPosMs
+    syncOverlayPlayers(pos)
+    syncAudioTrackPlayers(pos)
+  }
+
+  fun pause() {
+    if (isTrimPreviewMode) { pauseTrimPreview(); return }
+    engineController.pause()
+    overlayPlayers.values.forEach { try { it.playWhenReady = false; it.pause() } catch (_: Exception) {} }
+    audioTrackPlayers.values.forEach { try { it.playWhenReady = false; it.pause() } catch (_: Exception) {} }
+    _isPlaying.value = false
+  }
+
+  /**
+   * Frees every preview resource the export pipeline competes for, and keeps them freed until
+   * [prepareForEditorEntry] runs again.
+   *
+   * While the GPU preview compositor is active it holds up to [PreviewLayerPlanner.MAX_VIDEO_DECODERS]
+   * hardware decoders plus its own EGL context. An export then has to open its OWN decoders on top,
+   * and devices with a small MediaCodec instance budget refuse the export's first open
+   * (MediaCodec ERROR_INSUFFICIENT_RESOURCE) - the "filters/effects set ho to export fail hota hai"
+   * report. Without looks the preview stays on the player path (one decoder, the configuration every
+   * export has always been validated against), which is why those exports kept working.
+   *
+   * Everything rebuilt here comes back lazily: [prepareForEditorEntry] clears the suspension,
+   * [refreshCompositorMode] re-enters the compositor when the project needs it, and the sync
+   * functions reload overlay / audio players on the next timeline update.
+   */
+  fun suspendPreviewForExport() {
+    previewSuspendedForExport = true
+    pause()
+    releaseOverlayPlayers()
+    audioTrackPlayers.values.forEach { p ->
+      try { p.stop(); p.clearVideoSurface(); p.release() } catch (_: Exception) {}
+    }
+    audioTrackPlayers.clear()
+    audioLoadedUris.clear()
+    teardownCompositor()
+  }
+
+  fun togglePlayPause() {
+    if (isTrimPreviewMode) { toggleTrimPlayPause(); return }
+    engineController.togglePlayPause()
+  }
+
+  fun stepFrame(forward: Boolean, fps: Int? = null) {
+    pause()
+    val effectiveFps = fps ?: (_activeClip.value?.frameRate?.toInt() ?: 30).coerceIn(12, 120)
+    val frameMs = (1000L / effectiveFps).coerceAtLeast(1L)
+    seekTo(if (forward) currentPosMs + frameMs else currentPosMs - frameMs)
+  }
+
+  fun previewTrimRange(clip: VideoClip, startMs: Long, endMs: Long, loop: Boolean = true) {
+    isTrimPreviewMode = true
+    trimPreviewClip = clip
+    trimRangeStartMs = startMs.coerceAtLeast(0L)
+    trimRangeEndMs = endMs.coerceAtLeast(trimRangeStartMs + 50L)
+    _trimPlaybackPositionMs.value = trimRangeStartMs
+    // The trim tool shows the source through the main player's own surface.
+    refreshCompositorMode()
+    if (!isPlayableInPlayer(clip.uri)) return
+    engineController.playbackController.loadTrimPreview(
+      MediaPlayableUri.toExoPlayerUri(context, clip.uri), trimRangeStartMs, trimRangeEndMs,
+      clip.speed, if (clip.isMuted) 0f else clip.volume, loop
+    )
+  }
+
+  fun seekTrimPreview(offsetFromStartMs: Long) {
+    if (!isTrimPreviewMode) return
+    val offset = offsetFromStartMs.coerceIn(0L, trimRangeEndMs - trimRangeStartMs)
+    engineController.playbackController.seekTo(offset, resumeAfter = false, exact = true)
+    _trimPlaybackPositionMs.value = trimRangeStartMs + offset
+  }
+
+  fun seekTrimPreviewToSourceMs(sourceTimeMs: Long) {
+    if (!isTrimPreviewMode) return
+    val target = sourceTimeMs.coerceIn(trimRangeStartMs, trimRangeEndMs)
+    engineController.playbackController.seekTo(target - trimRangeStartMs, resumeAfter = false, exact = true)
+    _trimPlaybackPositionMs.value = target
+  }
+
+  fun stepTrimFrame(forward: Boolean, fps: Int? = null) {
+    if (!isTrimPreviewMode) return
+    pauseTrimPreview()
+    val effectiveFps = fps ?: (trimPreviewClip?.frameRate?.toInt() ?: 30).coerceIn(12, 120)
+    val delta = (1000L / effectiveFps).coerceAtLeast(1L)
+    seekTrimPreviewToSourceMs(if (forward) _trimPlaybackPositionMs.value + delta else _trimPlaybackPositionMs.value - delta)
+  }
+
+  // Trim preview transport is player level on purpose: the timeline transport (play/pause)
+  // re-seeks to the timeline CTI, which is outside the clipped trim window. See
+  // PlaybackController.playMediaPreview().
+  fun pauseTrimPreview() { if (isTrimPreviewMode) engineController.playbackController.pauseMediaPreview() }
+  fun playTrimPreview() { if (isTrimPreviewMode) engineController.playbackController.playMediaPreview() }
+
+  fun toggleTrimPlayPause() {
+    if (!isTrimPreviewMode) return
+    val controller = engineController.playbackController
+    val player = engineController.player
+    val playing = try { player.isPlaying } catch (_: Exception) { false }
+    if (playing) controller.pauseMediaPreview() else controller.playMediaPreview()
+  }
+
+  fun exitTrimPreview() {
+    if (!isTrimPreviewMode) return
+    isTrimPreviewMode = false
+    trimPreviewClip = null
+    trimPollJob?.cancel()
+    // The trim tool loaded a clipped MediaItem into the shared preview player. Dropping it is
+    // mandatory: the old exit kept the clipped item loaded (the uri cache still matched), so
+    // the preview stayed trapped inside the trim window until another clip was selected.
+    engineController.playbackController.endTrimPreview()
+    engineController.seekTo(currentPosMs)
+    refreshCompositorMode()
+  }
+
+  private fun startTrimPolling() {
+    trimPollJob?.cancel()
+    trimPollJob = scope.launch {
+      while (isActive && isTrimPreviewMode) {
+        val p = player.currentPosition
+        val source = (trimRangeStartMs + p).coerceIn(trimRangeStartMs, trimRangeEndMs)
+        _trimPlaybackPositionMs.value = source
+        delay(UI_TICK_MS)
+      }
+    }
+  }
+
+  private fun findClipAt(posMs: Long): VideoClip? = currentTimeline.videoClips.firstOrNull {
+    posMs >= it.timelineStartMs && posMs < it.timelineStartMs + it.durationMs
+  }
+
+  fun release() {
+    if (PreviewVideoSurfaceRegistry.onPlayerSurfaceBound != null) {
+      PreviewVideoSurfaceRegistry.onPlayerSurfaceBound = null
+    }
+    spatialLookJob?.cancel()
+    pausedRepaintJob?.cancel()
+    pausedRepaintJob = null
+    deferredFlushJob?.cancel()
+    deferredFlushJob = null
+    trimPollJob?.cancel()
+    scope.cancel()
+    teardownCompositor()
+    compositorSurfaces.clear()
+    previewCompositor.release()
+    overlayPlayers.values.forEach { try { it.stop(); it.release() } catch (_: Exception) {} }
+    overlayPlayers.clear()
+    overlayLoadedUris.clear()
+    audioTrackPlayers.values.forEach { try { it.stop(); it.release() } catch (_: Exception) {} }
+    audioTrackPlayers.clear()
+    audioLoadedUris.clear()
+    engineController.release()
+  }
+}

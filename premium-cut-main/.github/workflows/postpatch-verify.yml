@@ -1,0 +1,599 @@
+name: Post-patch verification (filters / colour)
+
+# Verification workflow for the Filters / Adjust / Video Quality patch.
+#
+# It runs exactly the commands the report promises —
+#   ./gradlew :app:compileDebugKotlin
+#   ./gradlew :app:testDebugUnitTest
+#   ./gradlew test                (every variant, the task the main CI uses)
+#   ./gradlew :app:assembleDebugAndroidTest
+#   ./gradlew :app:lintDebug
+# — plus the device (emulator with a real GLES driver) instrumented tests, and then posts the
+# results as a pull-request comment. The comment matters: the runner logs and the artifact
+# downloads of this repository are not reachable from the reviewing workstation, so the numbers
+# have to come back through the API.
+#
+# The device job also pulls `look-verification.txt`, which the instrumented tests write with the
+# measured pixel deltas, shader compile logs and export frame comparisons.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: postpatch-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CMAKE_VERSION: '3.22.1'
+  NDK_VERSION: '28.2.13676358'
+  APP_ID: 'com.aistudio.videostudio.hkmqzp'
+
+jobs:
+  build-and-unit-tests:
+    name: Build, unit tests, lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle Wrapper executable
+        run: chmod +x gradlew
+
+      - name: Install Android SDK toolchain (CMake + NDK)
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort | tail -1)"
+          if [ -z "$SDKMANAGER" ]; then echo "sdkmanager not found under $SDK_ROOT"; exit 1; fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          if [ ! -d "$SDK_ROOT/cmake/$CMAKE_VERSION" ] || [ ! -d "$SDK_ROOT/ndk/$NDK_VERSION" ]; then
+            installed=0
+            for attempt in 1 2 3; do
+              if "$SDKMANAGER" --install "cmake;$CMAKE_VERSION" "ndk;$NDK_VERSION"; then installed=1; break; fi
+              echo "sdkmanager install failed (attempt $attempt); retrying in $((attempt * 20))s"
+              sleep $((attempt * 20))
+            done
+            if [ "$installed" != "1" ]; then
+              echo "Could not install CMake $CMAKE_VERSION / NDK $NDK_VERSION"
+              exit 1
+            fi
+          fi
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" || true
+          test -d "$SDK_ROOT/cmake/$CMAKE_VERSION"
+          test -d "$SDK_ROOT/ndk/$NDK_VERSION"
+
+      - name: Toolchain versions
+        run: |
+          java -version
+          ./gradlew --version
+
+      - name: Compile Kotlin (debug)
+        run: |
+          set -o pipefail
+          mkdir -p gradle-logs
+          ./gradlew :app:compileDebugKotlin --stacktrace 2>&1 | tee gradle-logs/01-compile-debug-kotlin.log
+
+      - name: Debug unit tests
+        if: always()
+        run: |
+          set -o pipefail
+          mkdir -p gradle-logs
+          ./gradlew :app:testDebugUnitTest --stacktrace 2>&1 | tee gradle-logs/02-test-debug-unit.log
+
+      - name: All unit tests (every variant)
+        if: always()
+        run: |
+          set -o pipefail
+          mkdir -p gradle-logs
+          ./gradlew test --stacktrace 2>&1 | tee gradle-logs/03-test-all-variants.log
+
+      - name: Compile instrumented tests (androidTest APK)
+        if: always()
+        run: |
+          set -o pipefail
+          mkdir -p gradle-logs
+          ./gradlew :app:assembleDebugAndroidTest --stacktrace 2>&1 | tee gradle-logs/04-assemble-androidtest.log
+
+      - name: Android Lint
+        if: always()
+        run: |
+          set -o pipefail
+          mkdir -p gradle-logs
+          ./gradlew :app:lintDebug --stacktrace 2>&1 | tee gradle-logs/05-lint-debug.log
+
+      - name: Summarise unit-test results
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, os, xml.etree.ElementTree as ET
+          out = ["## Automated build + unit tests (`./gradlew`)", ""]
+          rows = []
+          failures = []
+          for path in sorted(glob.glob("app/build/test-results/**/*.xml", recursive=True)):
+              try:
+                  root = ET.parse(path).getroot()
+              except Exception as exc:
+                  out.append(f"- could not parse {path}: {exc}")
+                  continue
+              suite = root.get("name", os.path.basename(path))
+              tests = int(root.get("tests", 0)); fails = int(root.get("failures", 0))
+              errors = int(root.get("errors", 0)); skipped = int(root.get("skipped", 0))
+              if tests == 0 and fails == 0 and errors == 0:
+                  continue
+              rows.append((suite, tests, fails, errors, skipped, path))
+              for case in root.iter("testcase"):
+                  for kind in ("failure", "error"):
+                      node = case.find(kind)
+                      if node is not None:
+                          msg = (node.get("message") or (node.text or "")).strip().replace("\n", " ")[:600]
+                          failures.append(f"{case.get('classname')}.{case.get('name')} ({path}): {msg}")
+          total_tests = sum(r[1] for r in rows)
+          total_bad = sum(r[2] + r[3] for r in rows)
+          out.append(f"- suites: **{len(rows)}**, cases: **{total_tests}**, failed/errored: **{total_bad}**")
+          out.append(f"- report files found: {len(rows)}")
+          if failures:
+              out += ["", "### Failing cases", ""]
+              out += [f"- `{f}`" for f in failures[:40]]
+          else:
+              out += ["", "No failing unit test."]
+
+          # Runner logs are not reachable from the reviewing workstation, so the Gradle output of a
+          # failing step travels back inside this comment.
+          import glob as _glob
+          for log_path in sorted(_glob.glob("gradle-logs/*.log")):
+              text = open(log_path, errors="replace").read()
+              if "BUILD FAILED" not in text and "FAILURE:" not in text:
+                  continue
+              out += ["", f"### Gradle output — `{os.path.basename(log_path)}`", ""]
+              errors = [l for l in text.splitlines() if l.startswith("e: ") or "error:" in l][:60]
+              if errors:
+                  out += ["```", "\n".join(errors), "```", ""]
+              tail = text.splitlines()[-120:]
+              out += ["```", "\n".join(tail), "```"]
+          open("build-report.md", "w").write("\n".join(out) + "\n")
+          PY
+
+      - name: Upload reports
+        if: always()
+        continue-on-error: true  # artifacts are convenience outputs, never a CI gate
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 1  # cap Actions storage (stale APK/AAB piles hit the quota)
+          name: automated-android
+          path: |
+            build-report.md
+            gradle-logs
+            app/build/test-results
+            app/build/reports/tests
+          if-no-files-found: ignore
+
+  device-tests:
+    name: Device tests (emulator, real GLES)
+    needs: build-and-unit-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle Wrapper executable
+        run: chmod +x gradlew
+
+      # Same install as main.yml, and for the same reason this step exists in the device job: the
+      # androidTest APK needs the native library. It is also the step that failed run 38931475152 -
+      # a single `sdkmanager` invocation that had to download ~1 GB of NDK from dl.google.com, with
+      # no retry and no explanation when that download died. A transient network failure must not
+      # turn into "device tests: failure" with zero tests executed, so: retry, say what happened,
+      # and only then give up.
+      - name: Install Android SDK toolchain (CMake + NDK)
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort | tail -1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDK_ROOT"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          if [ -d "$SDK_ROOT/cmake/$CMAKE_VERSION" ] && [ -d "$SDK_ROOT/ndk/$NDK_VERSION" ]; then
+            echo "CMake $CMAKE_VERSION and NDK $NDK_VERSION are already installed"
+          else
+            installed=0
+            for attempt in 1 2 3; do
+              if "$SDKMANAGER" --install "cmake;$CMAKE_VERSION" "ndk;$NDK_VERSION"; then
+                installed=1
+                break
+              fi
+              echo "sdkmanager install failed (attempt $attempt); retrying in $((attempt * 20))s"
+              sleep $((attempt * 20))
+            done
+            if [ "$installed" != "1" ]; then
+              echo "Could not install CMake $CMAKE_VERSION / NDK $NDK_VERSION"
+              exit 1
+            fi
+          fi
+
+          test -d "$SDK_ROOT/cmake/$CMAKE_VERSION"
+          test -d "$SDK_ROOT/ndk/$NDK_VERSION"
+          echo "CMake: $(ls -d "$SDK_ROOT"/cmake/*)"
+          echo "NDK:   $(ls -d "$SDK_ROOT"/ndk/*)"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run instrumented tests on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot-save
+          disable-animations: true
+          script: |
+            # The emulator-runner action splits this block into ONE COMMAND PER LINE and runs each
+            # line in its own `/usr/bin/sh -c` (dash on the Ubuntu runner). So: no multi-line
+            # if/fi, no variable that must survive to the next line, no bash-only syntax, and every
+            # line has to exit 0 - the first non-zero line fails the whole step even when all 36
+            # tests pass. Two things kept this job red that way: a dangling `if [ ... ]; then`
+            # line (dash exits 2), and `pkill -f "adb logcat"`, whose pattern also matches the
+            # command line of the sh that runs it, so it killed its own parent (exit code null).
+            # Hence no background process here: logcat is dumped with -d after the run.
+            adb shell "getprop ro.build.version.sdk; getprop ro.hardware.egl" || true
+            # The default ring buffer evicts the beginning of a 25-minute instrumented run, and the
+            # export tests print their measurements as they go (System.out) - a 16 MB buffer keeps
+            # the whole run readable, which is how the complex-project numbers reach the report.
+            adb logcat -G 64M || true
+            adb logcat -c || true
+            ./gradlew :app:connectedDebugAndroidTest --stacktrace --continue > gradle-connected.log 2>&1; echo $? > gradle-exit.txt
+            adb logcat -d -v brief > logcat.txt 2>/dev/null || true
+            wc -l logcat.txt || true
+            # The report file is the complete record (logcat's ring buffer loses the beginning of a
+            # long run to the emulator's own chatter). Both copies are collected and whichever is
+            # longer is used, and every attempt leaves its output in look-pull-status.txt so a failed
+            # transfer is diagnosable from the pull request instead of silently falling back.
+            adb exec-out "run-as $APP_ID cat files/look-verification.txt" > look-internal.txt 2> look-pull-status.txt || true
+            adb shell "run-as $APP_ID ls -l files/" >> look-pull-status.txt 2>&1 || true
+            adb pull "/sdcard/Android/data/$APP_ID/files/look-verification.txt" look-verification.txt >> look-pull-status.txt 2>&1 || true
+            [ -s look-verification.txt ] || adb shell "cat /sdcard/Android/data/$APP_ID/files/look-verification.txt" > look-verification.txt 2>> look-pull-status.txt || true
+            wc -c look-verification.txt look-internal.txt >> look-pull-status.txt 2>&1 || true
+            tail -c 8000 gradle-connected.log || true
+            # The measurement file is evidence, not a nicety. When the tests pass but it is empty the
+            # run has thrown the measurements away - which is exactly what AGP's
+            # uninstall-the-APKs-after-the-run behaviour did (see the note in gradle.properties):
+            # `run-as` answered "unknown package" for the whole report and 48 passing tests published
+            # an empty "Measured pixels" section. Fail the step so that can never be silent again.
+            if [ ! -s look-verification.txt ] && [ ! -s look-internal.txt ] && [ "$(cat gradle-exit.txt 2>/dev/null)" = "0" ]; then echo "::error::the instrumented tests passed but the device report file is empty: the measurements were lost"; exit 1; fi
+            if [ ! -s look-verification.txt ] && [ ! -s look-internal.txt ] && [ "$(cat gradle-exit.txt 2>/dev/null)" != "0" ]; then echo "::warning::the device report file is empty and the instrumented run exited $(cat gradle-exit.txt 2>/dev/null)"; fi
+            true
+
+      - name: Summarise instrumented results
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, os, xml.etree.ElementTree as ET
+          import glob as _glob
+          out = ["## Device tests (emulator, SwiftShader GLES)", ""]
+          failures = []
+          total = 0
+          for path in sorted(glob.glob("app/build/outputs/androidTest-results/**/*.xml", recursive=True)):
+              try:
+                  root = ET.parse(path).getroot()
+              except Exception as exc:
+                  out.append(f"- could not parse {path}: {exc}")
+                  continue
+              for suite in ([root] if root.tag == "testsuite" else root.iter("testsuite")):
+                  tests = int(suite.get("tests", 0)); total += tests
+                  out.append(
+                      f"- `{suite.get('name')}`: {tests} tests, {suite.get('failures', 0)} failures, "
+                      f"{suite.get('errors', 0)} errors, {suite.get('skipped', 0)} skipped, "
+                      f"{suite.get('time', '?')}s"
+                  )
+              for case in root.iter("testcase"):
+                  for kind in ("failure", "error"):
+                      node = case.find(kind)
+                      if node is not None:
+                          message = (node.get("message") or "").strip().replace("\n", " ")
+                          trace = (node.text or "").strip()
+                          detail = message if not trace else f"{message}\n{trace}"
+                          failures.append(
+                              f"{case.get('classname')}.{case.get('name')}:\n{detail[:3000]}"
+                          )
+          out.append(f"- total instrumented cases: **{total}**")
+          if failures:
+              # The full message and stack trace, not a 700-character preview: this comment is the
+              # only channel that reaches the reviewing workstation (runner logs and artifact
+              # downloads both redirect to a host that is unreachable from there).
+              out += ["", "### Failing device cases", "", "```",
+                      "\n\n".join(failures[:20])[:24000], "```"]
+          else:
+              out += ["", "No failing device test."]
+          report_candidates = [
+              path for path in ("look-verification.txt", "look-internal.txt")
+              if os.path.exists(path) and os.path.getsize(path) > 0
+          ]
+          if report_candidates:
+              path = max(report_candidates, key=lambda p: os.path.getsize(p))
+              text = open(path, errors="replace").read()
+              out += ["", f"### Measured pixels (written by the device tests — `{path}`)", "", "```",
+                      text.strip()[:15000], "```"]
+          else:
+              # Fall back to the stdout Gradle captured for the tests: every report line is also
+              # printed, so the measurements survive a failed pull and a crashed run.
+              scraped = []
+              for path in sorted(_glob.glob("app/build/outputs/androidTest-results/**/*.xml", recursive=True)):
+                  try:
+                      root = ET.parse(path).getroot()
+                  except Exception:
+                      continue
+                  for node in root.iter("system-out"):
+                      scraped.extend((node.text or "").splitlines())
+              if not scraped and os.path.exists("logcat.txt"):
+                  # Instrumentation stdout is redirected to logcat; strip the "I/System.out(pid): ".
+                  for raw in open("logcat.txt", errors="replace"):
+                      if "System.out" not in raw:
+                          continue
+                      payload = raw.split("): ", 1)[1].rstrip("\n") if "): " in raw else raw.rstrip("\n")
+                      if payload.strip():
+                          scraped.append(payload)
+              scraped = [line for line in scraped if line.strip()]
+              if scraped:
+                  out += ["", "### Measured pixels (scraped from the device stdout / logcat)", "", "```",
+                          "\n".join(scraped)[:30000], "```"]
+              else:
+                  out += ["", "`look-verification.txt` was not produced and the device stdout was empty."]
+          # Filtered logcat: the engine names its failures there (`HwVideoTextureSource`,
+          # `AsyncFramePipeline`, decoder/EGL/muxer lines), and the artifact zip that holds the full
+          # log is not downloadable from the reviewing workstation, so the decisive lines travel in
+          # this comment instead.
+          if os.path.exists("logcat.txt"):
+              hits = []
+              with open("logcat.txt", errors="replace") as handle:
+                  for raw in handle:
+                      line = raw.rstrip("\n")
+                      # Engine tags plus the platform tags that name codec/resource failures:
+                      # ACodec/CCodec print the OMX/c2 error (e.g. "Failed to allocate component
+                      # instance" = codec instance limit, exactly what a many-decoder export hits),
+                      # and the native-compositor tags say whether libah_engine was used at all.
+                      if any(word in line for word in ("AsyncFramePipeline", "HwVideoTextureSource",
+                                                       "ExportPipeline", "GpuCompositionRenderer",
+                                                       "ExportValidator", "ComplexProjectExport",
+                                                       "DecoderManager", "VideoExporter", "EglCore",
+                                                       "MediaCodec", "ExportDiagnostics", "CodecException",
+                                                       "NativeRenderBridge", "NativeEngineLoader",
+                                                       "MediaMuxer", "MPEG4Writer", "ACodec", "CCodec",
+                                                       "OMXClient", "MediaCodecList", "AudioExportProcessor",
+                                                       "VideoCompositionEngine", "CompositionRenderGraph")):
+                          hits.append(line)
+              # Head *and* tail: a complex-export failure can happen in the first test of the
+              # instrumented run (engine setup) or the last one (resource pressure), and the whole
+              # log does not fit in a comment.
+              body = "\n".join(hits)
+              window = body if len(body) <= 24000 else (
+                  body[:8000] + "\n... [device log truncated] ...\n" + body[-16000:]
+              )
+              out += ["", f"### Device log — engine/render/codec lines ({len(hits)} matched)", "", "```",
+                      window, "```"]
+          gradle_exit = None
+          if os.path.exists("gradle-exit.txt"):
+              try:
+                  gradle_exit = int(open("gradle-exit.txt").read().strip())
+              except ValueError:
+                  gradle_exit = None
+          if gradle_exit not in (None, 0):
+              note = (f"`./gradlew :app:connectedDebugAndroidTest` exited **{gradle_exit}**")
+              if not failures:
+                  note += (" although every XML report above is green - so the failure is in the "
+                           "instrumentation run itself, not in a test case.")
+              out += ["", note, ""]
+              log = ""
+              if os.path.exists("gradle-connected.log"):
+                  log = open("gradle-connected.log", errors="replace").read()
+              if log:
+                  idx = log.find("FAILURE:")
+                  excerpt = log[idx:idx + 8000] if idx >= 0 else log[-8000:]
+                  out += ["", "### Gradle output (failure section)", "", "```",
+                          excerpt.strip()[:8000], "```"]
+              else:
+                  out += ["", "_gradle-connected.log was not produced_"]
+
+          report = "\n".join(out) + "\n"
+
+          # A GitHub comment body is capped at 65536 characters and the publish job cats this file
+          # into one. Shrink the *largest* section at a time, never by cutting the document short:
+          # an earlier version of this code dropped everything after the first long block, which
+          # silently removed the measured pixels, the export measurements and the engine log from
+          # the comment while the run itself was green.
+          COMMENT_BUDGET = 54000
+
+          def find_section(doc, title):
+              start = doc.find(title)
+              if start < 0:
+                  return None
+              newline = doc.find("\n", start)
+              if newline < 0:
+                  return None
+              end = doc.find("\n### ", newline)
+              return start, newline, (len(doc) if end < 0 else end)
+
+          def shrink_section(doc, title, keep_chars):
+              where = find_section(doc, title)
+              if not where:
+                  return doc
+              start, newline, end = where
+              body = doc[newline:end]
+              if len(body) <= keep_chars:
+                  return doc
+              head = body[: keep_chars // 2]
+              tail = body[-(keep_chars - keep_chars // 2):]
+              return doc[:newline] + head + "\n... [section truncated to fit the comment] ...\n" + tail + doc[end:]
+
+          # Biggest, most redundant first: the scraped stdout repeats what the export-measurements
+          # and device-log sections already carry.
+          for title, keep in (("### Measured pixels", 1500), ("### Device log", 6000),
+                              ("### Export measurements", 6000), ("### Failing device cases", 6000),
+                              ("### Failing cases", 4000)):
+              if len(report) <= COMMENT_BUDGET:
+                  break
+              report = shrink_section(report, title, keep)
+          if len(report) > 62000:
+              report = report[:62000] + "\n\n_report truncated at 62000 characters_\n"
+          if os.path.exists("look-pull-status.txt"):
+              status = open("look-pull-status.txt", errors="replace").read().strip()
+              if status:
+                  out = out + ["", "### How the report file was collected", "", "```", status[:2000], "```"]
+                  report = "\n".join(out) + "\n"
+                  if len(report) > COMMENT_BUDGET:
+                      report = shrink_section(report, "### Measured pixels", 1500)
+          open("device-report.md", "w").write(report)
+          PY
+
+      - name: Gate on the instrumented reports
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, os, sys, xml.etree.ElementTree as ET
+          expected = [
+              "com.example.ExampleInstrumentedTest",
+              "com.example.engine.effects.ColorPipelineGpuInstrumentedTest",
+              "com.example.engine.export.ComplexProjectExportInstrumentedTest",
+              "com.example.engine.export.TrackedEffectExportInstrumentedTest",
+              "com.example.engine.export.CompositionRegressionInstrumentedTest",
+              "com.example.engine.export.ExportLookPersistenceInstrumentedTest",
+              "com.example.engine.export.ExportValidatorInstrumentedTest",
+              # The reported failure, as a device test: it must *run*, not merely exist. If it were
+              # ever skipped (or removed from the source set) the gate fails instead of passing
+              # quietly on the strength of the older suites.
+              "com.example.engine.export.ExportProgressStallInstrumentedTest",
+          ]
+          seen, bad, total = set(), [], 0
+          for path in sorted(glob.glob("app/build/outputs/androidTest-results/**/*.xml", recursive=True)):
+              try:
+                  root = ET.parse(path).getroot()
+              except Exception as exc:
+                  bad.append(f"{path} could not be parsed: {exc}")
+                  continue
+              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+              for suite in suites:
+                  name = suite.get("name") or ""
+                  seen.add(name)
+                  total += int(suite.get("tests", 0) or 0)
+                  for field in ("failures", "errors"):
+                      count = int(suite.get(field, 0) or 0)
+                      if count:
+                          bad.append(f"{name}: {count} {field}")
+          missing = [x for x in expected if x not in seen]
+          gradle_exit = None
+          if os.path.exists("gradle-exit.txt"):
+              try:
+                  gradle_exit = int(open("gradle-exit.txt").read().strip())
+              except ValueError:
+                  gradle_exit = None
+          print(f"suites seen: {sorted(seen)}")
+          print(f"total instrumented cases: {total}; gradle exit code: {gradle_exit}")
+          problems = list(bad)
+          if missing:
+              problems.append(f"suites that never reported a result: {missing}")
+          if total < 30:
+              problems.append(f"only {total} instrumented cases ran, expected at least 30")
+          if problems:
+              print("GATE FAILED:")
+              for problem in problems:
+                  print(f" - {problem}")
+              sys.exit(1)
+          print(f"GATE PASSED: every instrumented case passed ({total} cases)")
+          if gradle_exit not in (None, 0):
+              print(f"note: gradle exited {gradle_exit} - the reason is quoted in the summary comment")
+          PY
+
+      - name: Upload device reports
+        if: always()
+        continue-on-error: true  # artifacts are convenience outputs, never a CI gate
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 1  # cap Actions storage (stale APK/AAB piles hit the quota)
+          name: device-results
+          path: |
+            device-report.md
+            look-verification.txt
+            look-internal.txt
+            look-pull-status.txt
+            logcat.txt
+            gradle-connected.log
+            gradle-exit.txt
+            gradle-logs
+            app/build/reports/androidTests
+            app/build/outputs/androidTest-results
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish results on the pull request
+    needs: [build-and-unit-tests, device-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download reports
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compose and post the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUILD_RESULT: ${{ needs.build-and-unit-tests.result }}
+          DEVICE_RESULT: ${{ needs.device-tests.result }}
+        run: |
+          {
+            echo "### Post-patch verification — \`${{ github.sha }}\`"
+            echo
+            echo "- build + unit tests job: **${BUILD_RESULT}**"
+            echo "- device (emulator) tests job: **${DEVICE_RESULT}**"
+            echo "- run: ${RUN_URL}"
+            echo
+            cat artifacts/automated-android/build-report.md 2>/dev/null || echo "_no automated report_"
+            echo
+            cat artifacts/device-results/device-report.md 2>/dev/null || echo "_no device report_"
+          } > comment.md
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file comment.md
+          else
+            echo "no pull request number; comment body follows"
+            cat comment.md
+          fi

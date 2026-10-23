@@ -1,0 +1,18 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+build/
+/captures
+.externalNativeBuild
+.cxx
+*.jks
+.env
+terminals/
+serviceAccountKey.json
+tools/assets/serviceAccountKey.json
+node_modules/
+
+# Python bytecode from toolchain/verify scripts
+__pycache__/

@@ -1,0 +1,78 @@
+package com.example
+
+import android.app.Application
+import android.util.Log
+import com.example.domain.StudioAccountManager
+import com.example.engine.NativeEngineLoader
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+class StudioApplication : Application() {
+  companion object {
+    lateinit var instance: StudioApplication
+      private set
+  }
+
+  private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+  override fun onCreate() {
+    super.onCreate()
+    instance = this
+    com.example.engine.color.ColorEngineHost.init(this)
+    com.example.engine.effects.ProductionEffectCatalog.install()
+    // Bundled Shapes/Elements library: asset bitmap cache for the panel grid
+    // and the canvas renderer (original assets, no Firebase).
+    com.example.ui.components.elements.ElementAssetCache.init(this)
+    
+    // Global safety uncaught exception handler: logs error and prevents unnecessary hard crashes
+    val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+    Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+      Log.e("StudioApplication", "Handled uncaught exception on thread: ${thread.name}: ${throwable.message}", throwable)
+      if (thread == android.os.Looper.getMainLooper().thread) {
+        defaultHandler?.uncaughtException(thread, throwable)
+      }
+    }
+
+    // Auth, Firestore, and Storage all use project gen-lang-client-0291066258.
+    try {
+      com.example.data.firebase.FirebaseBootstrap.ensure(this)
+    } catch (t: Throwable) {
+      Log.w("StudioApplication", "FirebaseApp initialization offline fallback: ${t.message}")
+    }
+
+    // 2. Safe Native Library Loader
+    try {
+      NativeEngineLoader.loadLibrary()
+    } catch (t: Throwable) {
+      Log.w("StudioApplication", "Native library loader skipped/failed", t)
+    }
+
+    // 3. Safe Asynchronous Studio Account & Firebase Initialization (off main thread)
+    appScope.launch {
+      try {
+        StudioAccountManager.init(applicationContext)
+      } catch (t: Throwable) {
+        Log.w("StudioApplication", "StudioAccountManager init skipped/failed", t)
+      }
+      try {
+        com.example.data.firebase.FirebaseEffectsManager.init(applicationContext)
+      } catch (t: Throwable) {
+        Log.w("StudioApplication", "FirebaseEffectsManager init skipped/failed", t)
+      }
+      try {
+        // Start the Firebase text-template download at app launch (Firestore live sync +
+        // Storage catalog), so templates are already merged when the user taps Add Text.
+        com.example.engine.text.registry.TextTemplateCatalog.ensureLoaded(applicationContext)
+      } catch (t: Throwable) {
+        Log.w("StudioApplication", "TextTemplateCatalog load skipped/failed", t)
+      }
+      try {
+        com.example.data.repository.NotificationRepository.init(applicationContext)
+      } catch (t: Throwable) {
+        Log.w("StudioApplication", "NotificationRepository init skipped/failed", t)
+      }
+    }
+  }
+}

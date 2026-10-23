@@ -1,0 +1,662 @@
+package com.example.engine.composition.gpu
+
+import android.content.Context
+import android.graphics.SurfaceTexture
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.net.Uri
+import android.opengl.GLES11Ext
+import android.opengl.GLES20
+import android.opengl.Matrix
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.SystemClock
+import android.util.Log
+import android.view.Surface
+import com.example.domain.model.VideoClip
+import com.example.engine.controller.DecoderManager
+import com.example.engine.export.CodecAllocationPolicy
+import com.example.engine.media.MediaMetadataHelper
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Production-grade hardware and software fallback video frame decoder and OpenGL OES texture source.
+ *
+ * Provides:
+ * - MediaExtractor initialization & track selection for content/file/raw URIs.
+ * - Hardware MediaCodec decoding with automatic graceful software fallback via DecoderManager.
+ * - Direct zero-copy hardware rendering to SurfaceTexture / external OES texture.
+ * - Frame-accurate seeking with pre-roll frame dropping (not rendering pre-roll frames to Surface).
+ * - CFR & VFR presentation timestamp synchronization and frame repetition upon EOF.
+ * - Video geometry handling: orientation metadata (0°, 90°, 180°, 270°), aspect ratio, scaling.
+ * - Robust error recovery, codec flush, and leak-free resource release in reverse allocation order.
+ */
+class HardwareVideoTextureSource : SurfaceTexture.OnFrameAvailableListener {
+  companion object {
+    private const val TAG = "HwVideoTextureSource"
+    private const val DEFAULT_TIMEOUT_US = 2_000L
+    /** Upper bound for a single decodeFrame() call (a seek can require decoding a whole GOP). */
+    private const val DECODE_DEADLINE_MS = 12_000L
+    /** A decoder that has never produced a single picture is considered hung after this long. */
+    private const val FIRST_PICTURE_DEADLINE_MS = 4_000L
+    /** How long to wait for a frame released to the Surface to arrive at the SurfaceTexture. */
+    private const val FRAME_ARRIVAL_TIMEOUT_MS = 1_500L
+    private const val JUMP_SEEK_THRESHOLD_US = 1_200_000L
+    /** Max samples queued per decode step while keeping the codec fed (decoder queue depth). */
+    private const val MAX_INPUT_BURST = 16
+  }
+
+  var oesTextureId: Int = 0
+    private set
+  var surfaceTexture: SurfaceTexture? = null
+    private set
+  var decoderSurface: Surface? = null
+    private set
+
+  private var codec: MediaCodec? = null
+  private var extractor: MediaExtractor? = null
+
+  /**
+   * Why the last [initialize] / [decodeFrame] failed; null when the last call succeeded.
+   *
+   * Without it a caller only learns "no picture", and the export ends in
+   * "Could not decode a video frame from X" without the codec's own reason (instance limit,
+   * unsupported profile, decoder that never produced output). The message travels into the export
+   * exception and therefore into the user-visible "Export failed" diagnostics.
+   */
+  @Volatile var lastError: String? = null
+    private set
+
+  var width: Int = 1920
+    private set
+  var height: Int = 1080
+    private set
+  var rotationDegrees: Int = 0
+    private set
+  val effectiveWidth: Int get() = if (rotationDegrees == 90 || rotationDegrees == 270) height else width
+  val effectiveHeight: Int get() = if (rotationDegrees == 90 || rotationDegrees == 270) width else height
+
+  var frameRate: Float = 30f
+
+  /** Duration of the video track in microseconds (0 when the container does not declare one). */
+  var durationUs: Long = 0L
+    private set
+  var isHardwareAccelerated: Boolean = true
+    private set
+  var isInitialized: Boolean = false
+    private set
+
+  /** MIME type of the source track this decoder was opened for (empty before [initialize]). */
+  var mime: String = ""
+    private set
+
+  private var lastRequestUs = Long.MIN_VALUE
+  private var isInputEos = false
+  private var isOutputEos = false
+  private var lastRenderedPtsUs = Long.MIN_VALUE
+  private val frameAvailable = AtomicBoolean(false)
+  private var inputsQueued = 0L
+  private var outputsDequeued = 0L
+
+  /** Decoded output buffer that is in the future relative to the last request; kept for a later call. */
+  private var heldIndex = -1
+  private var heldPtsUs = 0L
+
+  /** True once at least one decoded frame has actually reached the SurfaceTexture since the last seek. */
+  @Volatile var hasPicture: Boolean = false
+    private set
+
+  /** Total frames successfully delivered to the SurfaceTexture (monotonic over the source's life). */
+  @Volatile var deliveredFrames: Long = 0L
+    private set
+
+  private var ownedHandlerThread: HandlerThread? = null
+  private val surfaceLock = Any()
+  /** Signalled by [onFrameAvailable]; the GL thread waits on it instead of polling. */
+  private val frameArrivalLock = Object()
+
+  val transformMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
+  private var loggedTransform = false
+  private var clipIdForLog: String = ""
+  private var glHandler: Handler? = null
+
+  /**
+   * Initializes the decoder and OES texture surface for the given VideoClip.
+   */
+  fun initialize(
+    context: Context,
+    clip: VideoClip,
+    glHandler: Handler? = null,
+    decoderHandler: Handler? = null,
+    decoderManager: DecoderManager = DecoderManager(),
+    preferHardware: Boolean = true
+  ): Boolean {
+    if (isInitialized) return true
+    this.glHandler = glHandler
+    this.clipIdForLog = clip.id
+
+    try {
+      // 1. Initialize MediaExtractor
+      val ex = MediaExtractor()
+      // Assign to the field immediately: if setDataSource or the track scan below throws, the
+      // catch-all's release() must see the extractor - leaving it null leaked one native
+      // MediaExtractor per failed decoder-open (the retry ladder can fail several times per clip).
+      extractor = ex
+      val uri = try { Uri.parse(clip.uri) } catch (_: Exception) { null }
+      if (uri != null && (uri.scheme == "content" || uri.scheme == "file")) {
+        ex.setDataSource(context, uri, null)
+      } else {
+        ex.setDataSource(clip.uri)
+      }
+
+      // 2. Locate video track
+      var trackIndex = -1
+      var trackFormat: MediaFormat? = null
+      for (i in 0 until ex.trackCount) {
+        val format = ex.getTrackFormat(i)
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+        if (mime.startsWith("video/")) {
+          trackIndex = i
+          trackFormat = format
+          break
+        }
+      }
+
+      if (trackIndex < 0 || trackFormat == null) {
+        Log.w(TAG, "No valid video track found in ${clip.uri}")
+        lastError = "no video track in ${clip.uri}"
+        ex.release()
+        extractor = null
+        return false
+      }
+
+      ex.selectTrack(trackIndex)
+
+      // 3. Extract dimensions and rotation metadata
+      // Track duration only. MediaExtractor.durationUs() needs API 28 while this app runs on API 24+.
+      durationUs = if (trackFormat.containsKey(MediaFormat.KEY_DURATION)) {
+        runCatching { trackFormat.getLong(MediaFormat.KEY_DURATION) }.getOrDefault(0L)
+      } else {
+        0L
+      }
+      val rawW = trackFormat.getInteger(MediaFormat.KEY_WIDTH).coerceAtLeast(1)
+      val rawH = trackFormat.getInteger(MediaFormat.KEY_HEIGHT).coerceAtLeast(1)
+      val meta = MediaMetadataHelper.extractMetadata(context, clip.uri)
+      rotationDegrees = meta.rotationDegrees
+      frameRate = if (meta.frameRate in 10f..120f) meta.frameRate else 30f
+      width = if (clip.width > 0) clip.width else rawW
+      height = if (clip.height > 0) clip.height else rawH
+
+      // 4. Create OpenGL OES texture and Surface on GL thread
+      val latch = CountDownLatch(1)
+      var glSuccess = false
+      val setupGlAction = Runnable {
+        try {
+          setupTextureAndSurface(decoderHandler)
+          glSuccess = true
+        } catch (e: Exception) {
+          Log.e(TAG, "Failed creating OES texture/surface", e)
+        } finally {
+          latch.countDown()
+        }
+      }
+
+      if (glHandler != null && android.os.Looper.myLooper() != glHandler.looper) {
+        glHandler.post(setupGlAction)
+        if (!latch.await(3, TimeUnit.SECONDS) || !glSuccess) {
+          lastError = "OES texture/SurfaceTexture could not be created on the GL thread"
+          release()
+          return false
+        }
+      } else {
+        setupGlAction.run()
+        if (!glSuccess) {
+          lastError = "OES texture/SurfaceTexture could not be created on the GL thread"
+          release()
+          return false
+        }
+      }
+
+      // 5. Open the decoder through the candidate ladder (see CodecAllocationPolicy): hardware for
+      //    this MIME type first, then the platform's software decoder for the same MIME type.
+      //
+      //    Each candidate is created, configured AND started as one unit on purpose. A device that
+      //    has no codec instance left refuses at configure()/start() as often as it does at
+      //    creation, and the previous code only had a fallback for the creation step: a refusal any
+      //    later ended the export with "decoder setup failed ... errorCode=1100" although the
+      //    software decoder for that same MIME type was still there to be used. Software decoding
+      //    changes how fast the picture arrives, never the picture itself, so nothing the user
+      //    added is dropped here.
+      val mime = trackFormat.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_VIDEO_AVC
+      this.mime = mime
+      val candidates = CodecAllocationPolicy.candidates(
+        mime = mime,
+        hardwareName = if (preferHardware) decoderManager.findHardwareDecoderName(mime) else null,
+        softwareName = decoderManager.findSoftwareDecoderName(mime),
+        preferHardware = preferHardware
+      )
+      // Every attempt's reason is kept: the export reports "decoder setup failed" with the codec
+      // names it actually tried, which is what makes a device-side failure diagnosable.
+      val attempts = mutableListOf<String>()
+      var opened: MediaCodec? = null
+      var openedIsHardware = false
+      for (candidate in candidates) {
+        val dec = try {
+          if (candidate.name != null) {
+            MediaCodec.createByCodecName(candidate.name)
+          } else {
+            MediaCodec.createDecoderByType(mime)
+          }
+        } catch (e: Exception) {
+          attempts.add("${candidate.label}: ${describeFailure(e)}")
+          continue
+        }
+        try {
+          // The GPU compositor applies clip.naturalRotation itself (see GpuCompositionRenderer).
+          // MediaCodec would otherwise also bake KEY_ROTATION into the SurfaceTexture transform
+          // matrix, rotating the frame twice (upside-down / sideways export).
+          try {
+            trackFormat.setInteger(
+              MediaFormat.KEY_ROTATION,
+              com.example.engine.export.ExportOrientationPolicy.DECODER_KEY_ROTATION_DEGREES
+            )
+          } catch (_: Exception) {}
+          // HDR sources (HLG / PQ, BT.2020) used to be decoded with their HDR transfer intact
+          // while the export tags the file SDR Rec.709 - washed-out/overexposed output on every
+          // player. Requesting SDR tone mapping asks the decoder to convert the transfer; codecs
+          // that cannot simply ignore the key, and non-HDR sources are never touched.
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val transfer = runCatching { trackFormat.getInteger(MediaFormat.KEY_COLOR_TRANSFER, 0) }.getOrDefault(0)
+            if (transfer == MediaFormat.COLOR_TRANSFER_HLG || transfer == MediaFormat.COLOR_TRANSFER_ST2084) {
+              try {
+                trackFormat.setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                Log.i("HardwareVideoTextureSource", "HDR source (transfer=$transfer): requesting SDR tone mapping from the decoder")
+              } catch (e: Exception) {
+                Log.w("HardwareVideoTextureSource", "Could not request SDR tone mapping: ${e.message}")
+              }
+            }
+          }
+          dec.configure(trackFormat, decoderSurface, null, 0)
+          dec.start()
+          opened = dec
+          // The resolved name decides, not the ladder step: on a device whose platform default is a
+          // software codec, counting it as hardware would spend the instance budget on it.
+          openedIsHardware = candidate.hardware && !CodecAllocationPolicy.looksSoftware(dec.name)
+          break
+        } catch (e: Exception) {
+          attempts.add("${candidate.label}: ${describeFailure(e)}")
+          try { dec.release() } catch (_: Throwable) {}
+        }
+      }
+      val dec = opened
+      if (dec == null) {
+        lastError = "decoder setup failed for ${clip.uri}: " +
+          (attempts.ifEmpty { listOf("no decoder candidate for $mime") }).joinToString("; ")
+        release()
+        return false
+      }
+
+      codec = dec
+      isHardwareAccelerated = openedIsHardware
+      isInitialized = true
+      lastError = null
+      Log.d(
+        TAG,
+        "Initialized decoder for ${clip.id} on ${if (openedIsHardware) "hardware" else "software"} " +
+          "($mime, ${width}x${height}, rot=$rotationDegrees, candidates=${candidates.size})"
+      )
+      return true
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to initialize HardwareVideoTextureSource for ${clip.uri}", e)
+      lastError = "decoder setup failed for ${clip.uri}: ${describeFailure(e)}"
+      release()
+      return false
+    }
+  }
+
+  /** `MediaCodec.CodecException` carries the codec's own error code and diagnostics; keep them. */
+  private fun describeFailure(t: Throwable): String {
+    val codecError = t as? MediaCodec.CodecException
+    val detail = if (codecError != null) {
+      " (errorCode=${codecError.errorCode} recoverable=${codecError.isRecoverable} " +
+        "transient=${codecError.isTransient} diagnostic=${codecError.diagnosticInfo})"
+    } else {
+      ""
+    }
+    return "${t.javaClass.name}: ${t.message}$detail"
+  }
+
+  private fun setupTextureAndSurface(decoderHandler: Handler?) {
+    if (oesTextureId == 0) {
+      val textures = IntArray(1)
+      GLES20.glGenTextures(1, textures, 0)
+      oesTextureId = textures[0]
+      GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+      GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+
+      val st = SurfaceTexture(oesTextureId)
+      // The callback must NOT be delivered to the GL thread: decodeFrame() blocks it while waiting
+      // for the frame to arrive, which would deadlock (and previously let updateTexImage run early).
+      val callbackHandler = decoderHandler ?: run {
+        val t = HandlerThread("HwVideoTextureSource-cb").also { it.start() }
+        ownedHandlerThread = t
+        Handler(t.looper)
+      }
+      st.setOnFrameAvailableListener(this, callbackHandler)
+      surfaceTexture = st
+      decoderSurface = Surface(st)
+    }
+  }
+
+  override fun onFrameAvailable(st: SurfaceTexture) {
+    frameAvailable.set(true)
+    // Wake the GL thread that is waiting for this picture. Polling with Thread.sleep(1) instead
+    // woke up late (sleep granularity is coarser than 1 ms) and burned CPU on thousands of frames.
+    synchronized(frameArrivalLock) { frameArrivalLock.notifyAll() }
+  }
+
+  /**
+   * Makes the SurfaceTexture show the source frame that belongs to [targetUs] (microseconds of source time).
+   *
+   * Semantics (frame-accurate, no drift):
+   *  - Frames clearly before the target are decoded and dropped (pre-roll, never sent to the Surface).
+   *  - A frame within half a source-frame of the target is rendered to the Surface.
+   *  - A frame clearly AFTER the target is held (not consumed); the previously rendered frame stays on the
+   *    texture. This is what keeps a 30 fps clip on a 60 fps timeline (or a 24 fps clip at 30 fps)
+   *    from running ahead of the timeline.
+   *  - After a render the call blocks until the frame has actually arrived at the SurfaceTexture, so the
+   *    following updateTexImage() never latches a stale/empty buffer (black or repeated frames).
+   *
+   * @return true when the texture holds a valid decoded picture for this request (rendered now, or held
+   *   from earlier); false if no picture could be produced at all (caller must treat as a decode failure).
+   * @throws IllegalStateException if the codec itself reports an error (caller may retry on a software decoder).
+   */
+  fun decodeFrame(
+    targetUs: Long,
+    cancelled: AtomicBoolean = AtomicBoolean(false),
+    @Suppress("UNUSED_PARAMETER") toleranceUs: Long = 40_000L
+  ): Boolean {
+    if (!isInitialized) {
+      lastError = "decoder is not initialized"
+      return false
+    }
+    val c = codec
+    val ex = extractor
+    if (c == null || ex == null) {
+      lastError = "decoder or extractor is missing"
+      return false
+    }
+
+    val frameDurUs = (1_000_000.0 / frameRate.coerceIn(10f, 240f)).toLong()
+    val halfWindowUs = (frameDurUs / 2).coerceIn(4_000L, 40_000L)
+
+    val lastShownUs = if (lastRenderedPtsUs == Long.MIN_VALUE) lastRequestUs else lastRenderedPtsUs
+    val needSeek = lastRequestUs == Long.MIN_VALUE ||
+      // any real backward step must seek: a forward-only decoder can never produce an earlier
+      // frame by decoding on. Reversed clips step back exactly one source frame per timeline
+      // frame, so with the old "more than a full frame back" threshold every other reversed
+      // frame was silently replaced by a duplicate of the previous picture. Only sub-half-frame
+      // wobble (ms rounding) stays seek-free.
+      targetUs < lastShownUs - halfWindowUs ||
+      // jumped far forward: cheaper to seek than to decode through
+      (targetUs - maxOf(lastShownUs, lastRequestUs) > JUMP_SEEK_THRESHOLD_US)
+    if (needSeek) {
+      releaseHeldOutput(c)
+      ex.seekTo(targetUs.coerceAtLeast(0L), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+      c.flush()
+      frameAvailable.set(false)
+      isInputEos = false
+      isOutputEos = false
+      hasPicture = false
+      lastRenderedPtsUs = Long.MIN_VALUE
+    }
+    lastRequestUs = targetUs
+
+    val info = MediaCodec.BufferInfo()
+    val noPictureYet = deliveredFrames == 0L
+    val deadlineMs = if (noPictureYet) FIRST_PICTURE_DEADLINE_MS else DECODE_DEADLINE_MS
+    val deadline = SystemClock.elapsedRealtime() + deadlineMs
+    var rendered = false
+
+    while (!cancelled.get()) {
+      if (SystemClock.elapsedRealtime() > deadline) {
+        Log.w(TAG, "decodeFrame timed out for target=${targetUs}us (hasPicture=$hasPicture inputs=$inputsQueued outputs=$outputsDequeued eosIn=$isInputEos)")
+        if (noPictureYet && outputsDequeued == 0L) {
+          lastError = "video decoder produced no output for target=${targetUs}us within " +
+            "${deadlineMs}ms (inputs=$inputsQueued queued, outputs=$outputsDequeued dequeued)"
+          throw IllegalStateException("Video decoder produced no output for target=${targetUs}us (inputs=$inputsQueued)")
+        }
+        break
+      }
+
+      val index: Int
+      val pts: Long
+      val size: Int
+      val eos: Boolean
+      if (heldIndex >= 0) {
+        index = heldIndex
+        pts = heldPtsUs
+        size = 1 // a held buffer is always a real frame
+        eos = false
+        heldIndex = -1
+      } else {
+        // Queue everything the codec accepts first, then wait for output only if the input was
+        // already saturated (otherwise the output is normally ready by now).
+        val fed = feedCodec(c, ex)
+        val out = c.dequeueOutputBuffer(info, if (fed) 0L else DEFAULT_TIMEOUT_US)
+        if (out >= 0) outputsDequeued++
+        when {
+          out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+            val f = c.outputFormat
+            if (f.containsKey(MediaFormat.KEY_WIDTH)) width = f.getInteger(MediaFormat.KEY_WIDTH)
+            if (f.containsKey(MediaFormat.KEY_HEIGHT)) height = f.getInteger(MediaFormat.KEY_HEIGHT)
+            continue
+          }
+          out == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+            if (isInputEos) {
+              // Decoder fully drained and nothing left: hold the last picture (end of clip).
+              isOutputEos = true
+              break
+            }
+            continue
+          }
+          out < 0 -> continue // INFO_OUTPUT_BUFFERS_CHANGED and friends
+        }
+        index = out
+        pts = info.presentationTimeUs.coerceAtLeast(0L)
+        size = info.size
+        eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+      }
+
+      if (eos && size == 0) {
+        c.releaseOutputBuffer(index, false)
+        isOutputEos = true
+        break
+      }
+
+      val future = pts > targetUs + halfWindowUs
+      val stale = pts < targetUs - halfWindowUs && !eos
+      if (future && hasPicture) {
+        heldIndex = index
+        heldPtsUs = pts
+        break
+      }
+      if (stale) {
+        c.releaseOutputBuffer(index, false)
+        continue
+      }
+
+      // In window, or the first picture after a seek (nothing to show yet): render it.
+      frameAvailable.set(false)
+      c.releaseOutputBuffer(index, true)
+      lastRenderedPtsUs = pts
+      rendered = true
+      if (eos) isOutputEos = true
+      break
+    }
+
+    if (rendered) {
+      if (awaitFrameArrival(cancelled)) {
+        hasPicture = true
+        deliveredFrames++
+        lastError = null
+      } else {
+        Log.w(TAG, "Decoded frame never arrived at SurfaceTexture (target=${targetUs}us)")
+        lastError = "decoded frame never arrived at the SurfaceTexture for target=${targetUs}us " +
+          "within ${FRAME_ARRIVAL_TIMEOUT_MS}ms (outputs=$outputsDequeued)"
+      }
+    }
+    if (!hasPicture) {
+      lastError = lastError ?: (
+        "no decoded picture for target=${targetUs}us within ${deadlineMs}ms " +
+          "(inputs=$inputsQueued queued, outputs=$outputsDequeued dequeued, eosIn=$isInputEos)"
+        )
+    }
+    return hasPicture
+  }
+
+  /**
+   * Queues one compressed sample into the codec.
+   *
+   * @param timeoutUs how long to wait for a free input buffer; pass 0 for the "keep the codec
+   *   fed" loop that must never block the frame request.
+   * @return true when a sample was queued.
+   */
+  private fun feedInput(c: MediaCodec, ex: MediaExtractor, timeoutUs: Long = DEFAULT_TIMEOUT_US): Boolean {
+    if (isInputEos) return false
+    val inputIndex = c.dequeueInputBuffer(timeoutUs)
+    if (inputIndex < 0) return false
+    val input = c.getInputBuffer(inputIndex) ?: return false
+    input.clear()
+    val sampleSize = ex.readSampleData(input, 0)
+    if (sampleSize < 0) {
+      c.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+      isInputEos = true
+      return false
+    }
+    c.queueInputBuffer(inputIndex, 0, sampleSize, ex.sampleTime.coerceAtLeast(0L), 0)
+    inputsQueued++
+    ex.advance()
+    return true
+  }
+
+  /**
+   * Fills the codec's input queue without blocking. A hardware decoder only emits a picture once
+   * enough input is queued (pipeline depth plus reordering), so feeding one sample per output
+   * dequeue made every frame pay a 2 ms "no output yet" timeout several times over.
+   */
+  private fun feedCodec(c: MediaCodec, ex: MediaExtractor): Boolean {
+    var fed = false
+    var guard = 0
+    while (guard++ < MAX_INPUT_BURST && feedInput(c, ex, 0L)) fed = true
+    return fed
+  }
+
+  private fun awaitFrameArrival(cancelled: AtomicBoolean): Boolean {
+    val deadline = SystemClock.elapsedRealtime() + FRAME_ARRIVAL_TIMEOUT_MS
+    synchronized(frameArrivalLock) {
+      while (!frameAvailable.get()) {
+        val remaining = deadline - SystemClock.elapsedRealtime()
+        if (cancelled.get() || remaining <= 0L) return false
+        try {
+          frameArrivalLock.wait(remaining)
+        } catch (_: InterruptedException) {
+          return false
+        }
+      }
+    }
+    return true
+  }
+
+  fun updateTexImage(): FloatArray = synchronized(surfaceLock) {
+    val st = surfaceTexture ?: return transformMatrix
+    // Only latch when a new frame was actually delivered; otherwise the previous picture stays valid.
+    if (frameAvailable.getAndSet(false)) {
+      try {
+        st.updateTexImage()
+        st.getTransformMatrix(transformMatrix)
+        if (!loggedTransform) {
+          loggedTransform = true
+          com.example.engine.export.ExportDiagnostics.transformMatrixOnce(
+            clipIdForLog, rotationDegrees, transformMatrix
+          )
+        }
+      } catch (e: Exception) {
+        Log.w(TAG, "updateTexImage failed: ${e.message}")
+      }
+    }
+    return transformMatrix
+  }
+
+  /**
+   * Returns a held output buffer to the codec before flush/stop. Skipping this starves the
+   * hardware decoder of output slots and the next session stays on a black OES texture.
+   */
+  private fun releaseHeldOutput(c: MediaCodec?) {
+    val index = heldIndex
+    heldIndex = -1
+    if (index < 0 || c == null) return
+    try {
+      c.releaseOutputBuffer(index, false)
+    } catch (t: Throwable) {
+      Log.w(TAG, "Failed to release held output buffer $index: ${t.message}")
+    }
+  }
+
+  fun flush() = synchronized(surfaceLock) {
+    try {
+      releaseHeldOutput(codec)
+      codec?.flush()
+      hasPicture = false
+      lastRenderedPtsUs = Long.MIN_VALUE
+      lastRequestUs = Long.MIN_VALUE
+      isInputEos = false
+      isOutputEos = false
+      frameAvailable.set(false)
+    } catch (e: Exception) {
+      Log.w(TAG, "flush error: ${e.message}")
+    }
+  }
+
+  fun release() = synchronized(surfaceLock) {
+    isInitialized = false
+    releaseHeldOutput(codec)
+    try { codec?.stop() } catch (_: Throwable) {}
+    try { codec?.release() } catch (_: Throwable) {}
+    codec = null
+
+    try { extractor?.release() } catch (_: Throwable) {}
+    extractor = null
+
+    try { decoderSurface?.release() } catch (_: Throwable) {}
+    decoderSurface = null
+
+    try { surfaceTexture?.release() } catch (_: Throwable) {}
+    surfaceTexture = null
+
+    val texId = oesTextureId
+    if (texId != 0) {
+      oesTextureId = 0
+      val action = Runnable {
+        GLES20.glDeleteTextures(1, intArrayOf(texId), 0)
+      }
+      val handler = glHandler
+      if (handler != null && android.os.Looper.myLooper() != handler.looper) {
+        handler.post(action)
+      } else {
+        action.run()
+      }
+    }
+    ownedHandlerThread?.quitSafely()
+    ownedHandlerThread = null
+    Log.d(TAG, "HardwareVideoTextureSource released")
+  }
+}

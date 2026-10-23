@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">Premier Cut</string>
+    <string name="premier_cut">Premier Cut</string>
+    <string name="home">الرئيسية</string>
+    <string name="projects">المشاريع</string>
+    <string name="new_project">مشروع جديد</string>
+    <string name="import_video_prompt">استيراد فيديو وبدء التعديل</string>
+    <string name="account">الحساب</string>
+    <string name="notifications">الإشعارات</string>
+    <string name="no_notifications">لا توجد إشعارات</string>
+    <string name="settings">الإعدادات</string>
+    <string name="language">اللغة</string>
+    <string name="choose_app_language">اختر لغة التطبيق</string>
+    <string name="theme">المظهر</string>
+    <string name="choose_appearance">اختر المظهر العام</string>
+    <string name="auto_save">الحفظ التلقائي</string>
+    <string name="save_projects_automatically">حفظ المشاريع تلقائياً</string>
+    <string name="manage_app_notifications">إدارة إشعارات التطبيق</string>
+    <string name="gpu_preview_compositor">مُركِّب المعاينة عبر GPU (تجريبي)</string>
+    <string name="gpu_preview_compositor_desc">دمج كل المسارات على ساعة واحدة باستخدام مُصيِّر التصدير</string>
+    <string name="video_quality">جودة الفيديو</string>
+    <string name="choose_default_video_quality">اختر جودة التصدير الافتراضية</string>
+    <string name="help_and_support">المساعدة والدعم</string>
+    <string name="get_help_with_premier_cut">احصل على المساعدة مع Premier Cut</string>
+    <string name="about_premier_cut">حول Premier Cut</string>
+    <string name="profile">الملف الشخصي</string>
+    <string name="account_security">أمان الحساب</string>
+    <string name="storage">مساحة التخزين</string>
+    <string name="log_in">تسجيل الدخول</string>
+    <string name="log_out">تسجيل الخروج</string>
+</resources>

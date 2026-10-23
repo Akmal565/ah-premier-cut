@@ -1,0 +1,163 @@
+package com.example.engine.playback
+
+import androidx.media3.common.PlaybackException
+import com.example.engine.effects.media3.CustomShaderGlEffect
+import com.example.engine.effects.media3.IdentityPassthroughGlEffect
+import com.example.engine.effects.media3.Media3EffectPipeline
+import com.example.engine.effects.media3.PreviewEffectApplyPolicy
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
+class PreviewPipelineRecoveryTest {
+
+  @Test
+  fun identityPassthroughIsARealGraphNode() {
+    val identity = Media3EffectPipeline.identityEffects()
+    assertEquals(1, identity.size)
+    assertSame(IdentityPassthroughGlEffect, identity.single())
+    assertFalse(IdentityPassthroughGlEffect.isNoOp(1920, 1080))
+    assertTrue(IdentityPassthroughGlEffect.fragmentShader.contains("gl_FragColor"))
+    assertEquals(CustomShaderGlEffect.IDENTITY_FRAGMENT_SHADER, IdentityPassthroughGlEffect.fragmentShader)
+  }
+
+  @Test
+  fun recoveryUsesLastGoodGraphWhenAvailable() {
+    val lastGood = Media3EffectPipeline.identityEffects()
+    val recovered = PreviewEffectApplyPolicy.recoveryEffects(lastGood)
+    assertSame(lastGood.single(), recovered.single())
+  }
+
+  @Test
+  fun recoveryFallsBackToIdentityWhenNoLastGoodGraph() {
+    val recovered = PreviewEffectApplyPolicy.recoveryEffects(emptyList())
+    assertEquals(1, recovered.size)
+    assertSame(IdentityPassthroughGlEffect, recovered.single())
+  }
+
+  @Test
+  fun failedApplyOrPlayerErrorRecreatesThePlayer() {
+    assertTrue(PreviewEffectApplyPolicy.shouldRecreatePlayer(applyFailed = true, playerHasError = false))
+    assertTrue(PreviewEffectApplyPolicy.shouldRecreatePlayer(applyFailed = false, playerHasError = true))
+    assertFalse(PreviewEffectApplyPolicy.shouldRecreatePlayer(applyFailed = false, playerHasError = false))
+  }
+
+  @Test
+  fun videoProcessingFailureRecreatesThePlayer() {
+    val processing = PlaybackException("gpu", null, PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED)
+    val init = PlaybackException("init", null, PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSOR_INIT_FAILED)
+    val io = PlaybackException("io", null, PlaybackException.ERROR_CODE_IO_UNSPECIFIED)
+    assertTrue(PreviewPipelinePolicy.shouldRecreatePlayer(processing, applyFailed = false))
+    assertTrue(PreviewPipelinePolicy.shouldRecreatePlayer(init, applyFailed = false))
+    assertFalse(PreviewPipelinePolicy.shouldRecreatePlayer(io, applyFailed = false))
+    assertTrue(PreviewPipelinePolicy.shouldRecreatePlayer(io, applyFailed = true))
+  }
+
+  @Test
+  fun recoveryOrderIsLastGoodThenIdentityThenRecreate() {
+    assertEquals(
+      PreviewPipelinePolicy.RecoveryStep.RESTORE_LAST_GOOD,
+      PreviewPipelinePolicy.nextRecoveryStep(
+        lastGoodEffectCount = 2,
+        lastRestoreSucceeded = false,
+        identityApplySucceeded = false,
+        playerHasError = false
+      )
+    )
+    assertEquals(
+      PreviewPipelinePolicy.RecoveryStep.APPLY_IDENTITY,
+      PreviewPipelinePolicy.nextRecoveryStep(
+        lastGoodEffectCount = 0,
+        lastRestoreSucceeded = false,
+        identityApplySucceeded = false,
+        playerHasError = false
+      )
+    )
+    assertEquals(
+      PreviewPipelinePolicy.RecoveryStep.RECREATE_PLAYER,
+      PreviewPipelinePolicy.nextRecoveryStep(
+        lastGoodEffectCount = 1,
+        lastRestoreSucceeded = false,
+        identityApplySucceeded = false,
+        playerHasError = true
+      )
+    )
+  }
+
+  @Test
+  fun openingANewProjectMustResetThePipeline() {
+    assertTrue(PreviewPipelinePolicy.shouldResetOnProjectChange())
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Cold-launch compositor takeover after an ASYNC look-graph processing failure.
+  //
+  // `setVideoEffects` returns before Media3's GL pipeline is up, so a device whose frame
+  // processor cannot run the grading graph reports the failure through onPlayerError AFTER the
+  // engine recorded "APPLIED". Without a takeover there, the engine rolled back to the identity
+  // passthrough on EVERY look tap and filters stayed invisible until Chroma Key / Effects
+  // activated the compositor — the reported "filter preview only works after switching tools".
+  // ---------------------------------------------------------------------------------------
+
+  @Test
+  fun asyncProcessingFailureTakesTheCompositorOver() {
+    assertEquals(
+      PreviewPipelinePolicy.ProcessingFailureAction.COMPOSITOR_TAKEOVER,
+      PreviewPipelinePolicy.actionAfterProcessingFailure(
+        isVideoProcessingFailure = true,
+        compositorAlreadyActive = false,
+        compositorPreviouslyFailed = false
+      )
+    )
+  }
+
+  @Test
+  fun processingFailureKeepsThePlayerPathWhenCompositorAlreadyRuns() {
+    assertEquals(
+      PreviewPipelinePolicy.ProcessingFailureAction.KEEP_PLAYER_PATH,
+      PreviewPipelinePolicy.actionAfterProcessingFailure(
+        isVideoProcessingFailure = true,
+        compositorAlreadyActive = true,
+        compositorPreviouslyFailed = false
+      )
+    )
+  }
+
+  @Test
+  fun processingFailureDoesNotFlipFlopWhenTheCompositorAlsoFailed() {
+    // A device where BOTH renderers failed must stay on the player path and report, not loop.
+    assertEquals(
+      PreviewPipelinePolicy.ProcessingFailureAction.KEEP_PLAYER_PATH,
+      PreviewPipelinePolicy.actionAfterProcessingFailure(
+        isVideoProcessingFailure = true,
+        compositorAlreadyActive = false,
+        compositorPreviouslyFailed = true
+      )
+    )
+  }
+
+  @Test
+  fun nonProcessingFailuresNeverTriggerTheTakeover() {
+    // Decoder / IO errors keep the existing recovery semantics (rollback, recreate on repeat).
+    assertEquals(
+      PreviewPipelinePolicy.ProcessingFailureAction.KEEP_PLAYER_PATH,
+      PreviewPipelinePolicy.actionAfterProcessingFailure(
+        isVideoProcessingFailure = false,
+        compositorAlreadyActive = false,
+        compositorPreviouslyFailed = false
+      )
+    )
+  }
+
+  @Test
+  fun shaderProgramKeepsATwoSlotTexturePool() {
+    assertEquals(2, com.example.engine.effects.media3.CustomShaderGlShaderProgram.TEXTURE_POOL_CAPACITY)
+  }
+}
