@@ -51,6 +51,12 @@ void main() {
             append(ShaderChunks.COLOR).append('\n')
             append(ShaderChunks.NOISE).append('\n')
             append(ShaderChunks.UV).append('\n')
+            // BLEND ships with every composed shader: several bodies (light.glow's GLOW_COMBINE,
+            // trend.layer_echo, subject.action_paint/luminescence) call blendScreen/blendOverlay/
+            // blendSoftLight directly. Without it those programs could never link and the effect
+            // was silently quarantined on first use. chunkExtras may ADD chunks but must not
+            // re-declare these helpers.
+            append(ShaderChunks.BLEND).append('\n')
             if (chunkExtras.isNotBlank()) { append(chunkExtras).append('\n') }
             if (!effectBody.contains("vec2 warpUV")) append(DEFAULT_WARP)
             append(effectBody).append('\n')

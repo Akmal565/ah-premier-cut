@@ -2539,13 +2539,26 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     // body / photo / AI assets cover the whole selected clip. Intensity-only updates keep the
     // window the effect already has - dragging a strength slider must not teleport the span.
     val playWindowMs = if (effect != null && category == com.example.engine.effects.registry.EffectCategory.VIDEO_EFFECTS) {
-      val existing = if (!reanchorWindow) {
-        effect.shaderKey?.removePrefix("vfx:")?.let { existingVideoWindowMs(clip, it) }
-      } else null
-      existing ?: com.example.engine.effects.ProductionEffectApplicator.videoEffectWindow(
-        clip.durationMs,
-        timelineEngine.currentPositionMs.value - clip.timelineStartMs
-      )
+      if (reanchorWindow) {
+        com.example.engine.effects.ProductionEffectApplicator.videoEffectWindow(
+          clip.durationMs,
+          timelineEngine.currentPositionMs.value - clip.timelineStartMs
+        )
+      } else {
+        // Distinguish "effect absent" from "effect present but windowless": a whole-clip
+        // instance (windowStartUs == null, as written by the VFX stack panel) must STAY
+        // whole-clip here — the old code treated it as "no info" and injected a brand-new
+        // 3 s window, abruptly cutting the effect down to a third of the clip.
+        val existing = effect.shaderKey?.removePrefix("vfx:")?.let { existingVideoWindowState(clip, it) }
+        when (existing) {
+          is ExistingVideoWindow.Windowed -> existing.ms
+          is ExistingVideoWindow.WholeClip -> null
+          null -> com.example.engine.effects.ProductionEffectApplicator.videoEffectWindow(
+            clip.durationMs,
+            timelineEngine.currentPositionMs.value - clip.timelineStartMs
+          )
+        }
+      }
     } else null
     val next = if (effect == null) {
       com.example.engine.effects.ProductionEffectApplicator.clearCategory(clip, category)
@@ -2621,12 +2634,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     return getSelectedVideoClip()
   }
 
-  /** The 3s play window currently written on [clip] for [effectId], in ms, or null. */
-  private fun existingVideoWindowMs(clip: VideoClip, effectId: String): Pair<Long, Long>? {
+  /** Play-window state of [effectId] on [clip]: windowed, whole-clip, or not on the clip at all. */
+  private sealed interface ExistingVideoWindow {
+    data class Windowed(val ms: Pair<Long, Long>) : ExistingVideoWindow
+    object WholeClip : ExistingVideoWindow
+  }
+
+  private fun existingVideoWindowState(clip: VideoClip, effectId: String): ExistingVideoWindow? {
     val stack = com.example.engine.vfx.VfxEffectsHost.decode(clip.vfxStackJson)
     val inst = stack.effects().firstOrNull { it.definition.id == effectId } ?: return null
-    val startUs = inst.windowStartUs ?: return null
-    return (startUs / 1000L) to (inst.windowDurationUs / 1000L)
+    val startUs = inst.windowStartUs ?: return ExistingVideoWindow.WholeClip
+    return ExistingVideoWindow.Windowed((startUs / 1000L) to (inst.windowDurationUs / 1000L))
   }
 
   private fun mediaClip(id: String): VideoClip? {
@@ -3360,6 +3378,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     if (filter != null) {
       _arFilterScale.value = filter.defaultScale
       _arFilterOffsetY.value = filter.defaultOffsetY
+      // Reset opacity too: without this, filter B was baked with the opacity the user set for
+      // filter A (scale/offset snap to defaults, opacity silently carried over).
+      _arFilterOpacity.value = 1f
       if (filter.isMeshOverlay) {
         _showFaceMeshGrid.value = true
       }
@@ -3401,6 +3422,16 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
   fun appliedArOverlayFor(clipId: String?): com.ahstudio.face.overlay.ArOverlayParams? =
     clipId?.let { _arApplied.value[it] }
 
+  /**
+   * True when [clipId] carries a tracked effect clip (privacy mosaic / blur) bound to a
+   * tracking result. Those effects never land in the arOverlay map, so the AR panel needs
+   * this to show the Remove button for them.
+   */
+  fun hasTrackedEffectsFor(clipId: String?): Boolean =
+    clipId != null && timelineEngine.timeline.value.effectClips.any {
+      it.targetClipId == clipId && it.trackBindJson != null
+    }
+
   private fun commitArOverlay(clipId: String, params: com.ahstudio.face.overlay.ArOverlayParams?) {
     val codec = com.ahstudio.face.overlay.ArOverlayCodec
     // Round-trip through the codec so the in-memory value equals what hydrate() later decodes.
@@ -3426,9 +3457,31 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
   fun removeArFilterFromClip() {
     val clip = getSelectedVideoClip() ?: return
-    if (!_arApplied.value.containsKey(clip.id)) return
-    commitArOverlay(clip.id, null)
-    _arStatusMessage.value = "AR filter removed from the clip."
+    // Tracked mosaic/blur filters (canExport path) never land in _arApplied — applyArFilterToTimeline
+    // attaches a tracked effect clip + a following host mask instead. The old early-return made
+    // them PERMANENT: no Remove button, Reset silently did nothing, and the mosaic kept covering
+    // the face in preview and export.
+    var removedSomething = false
+    if (_arApplied.value.containsKey(clip.id)) {
+      commitArOverlay(clip.id, null)
+      removedSomething = true
+    }
+    val trackedEffectClips = timelineEngine.timeline.value.effectClips.filter {
+      it.targetClipId == clip.id && it.trackBindJson != null
+    }
+    trackedEffectClips.forEach { timelineEngine.deleteEffectClip(it.id) }
+    if (trackedEffectClips.isNotEmpty()) {
+      // Unbind the tracking mask bindHostMask installed, so the clip stops following the face.
+      timelineEngine.setClipMask(
+        clip.id,
+        clip.mask.copy(enabled = false, followTracking = false, trackBindJson = null)
+      )
+      runCatching { engineController.invalidateClip(clip.id) }
+      removedSomething = true
+    }
+    if (removedSomething) {
+      _arStatusMessage.value = "AR filter removed from the clip."
+    }
   }
 
   /** Rebuilds applied-filter state from the timeline after project load / undo / redo. */

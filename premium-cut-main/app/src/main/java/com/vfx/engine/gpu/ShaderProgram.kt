@@ -130,7 +130,7 @@ class ShaderCompiler {
  */
 class ShaderCache(private val compiler: ShaderCompiler) {
 
-    private val cache = LruCache<String, ShaderProgram>(256)
+    private val cache = LruCache<String, ShaderProgram>(256, onEvict = { it.release() })
 
     fun get(
         name: String,

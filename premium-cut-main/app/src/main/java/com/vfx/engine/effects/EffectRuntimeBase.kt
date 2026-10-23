@@ -81,19 +81,24 @@ open class SinglePassRuntime(
         }
         val es3b = ctx.caps.glesMajor >= 3
         val combine = ctx.programs.get("mask.combine", ShaderTemplate.vertex(es3b),
-            // MASK_COMBINE calls sdRoundBox/sdBox (MASK_SDF chunk) and blendComposite (BLEND chunk);
-            // both chunks must be present or the program can never link.
+            // MASK_COMBINE calls sdRoundBox/sdBox (MASK_SDF chunk); BLEND now ships with the
+            // template itself. MASK_SDF must be present or the program can never link.
             ShaderTemplate.fragment(es3b, EffectGlsl.MASK_COMBINE,
-                chunkExtras = ShaderChunks.BLEND + "\n" + ShaderChunks.MASK_SDF))
-        builder.addSecondaryInput("u_effect", effOut)
-        if (mask is Mask.Texture)
-            builder.addSecondaryInput("u_maskTex",
-                GpuTexture.adoptExternal(mask.textureHandle, input.width, input.height))
-        return builder.addPass("$shaderName.maskCombine", combine, input) { p ->
+                chunkExtras = ShaderChunks.MASK_SDF))
+        // addSecondaryInput patches the MOST RECENTLY ADDED pass, so these MUST come after the
+        // maskCombine addPass. Binding them before only patched the effOut pass (whose program
+        // has no u_effect/u_maskTex), leaving the combine pass to sample unit 0 = the raw input:
+        // every masked effect rendered the frame completely unchanged.
+        val combined = builder.addPass("$shaderName.maskCombine", combine, input) { p ->
             MaskPacking.apply(p, mask)
             p.setInt("u_blendMode", s.blendMode.glslCode)
             setMixUniforms(p, s, intensityOne = true)
         }
+        builder.addSecondaryInput("u_effect", effOut)
+        if (mask is Mask.Texture)
+            builder.addSecondaryInput("u_maskTex",
+                GpuTexture.adoptExternal(mask.textureHandle, input.width, input.height))
+        return combined
     }
 }
 

@@ -19,7 +19,9 @@ import java.util.IdentityHashMap
 class LutEngine(private val gpu: GpuContext) {
 
     private val lut3dCache = IdentityHashMap<CubeLut, GpuTexture>()
-    private val curveCache = LruCache<String, GpuTexture>(32)
+    // onEvict deletes the evicted GL texture; without it curve-LUT eviction leaked VRAM until
+    // context loss. clear() paths keep their explicit contracts (context loss passes null).
+    private val curveCache = LruCache<String, GpuTexture>(32, onEvict = { it.release() })
 
     fun get3dTexture(lut: CubeLut): GpuTexture {
         lut3dCache[lut]?.let { return it }

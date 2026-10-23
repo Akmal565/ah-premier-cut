@@ -57,16 +57,16 @@ class EglCore {
         val num = IntArray(1)
         if (!EGL14.eglChooseConfig(display, attrs, 0, configs, 0, 1, num, 0) || num[0] == 0) {
             // Retry without RECORDABLE (older devices / emulators).
-            val attrs2 = IntArray(attrs.size)
-            var skip = false
-            for (i in attrs.indices) {
-                if (attrs[i] == EGL_RECORDABLE_ANDROID) { skip = true; continue }
-                attrs2[if (skip) i - 2 + 0 else i] = attrs[i] // compact out the pair
-            }
-            val trimmed = attrs2.filterIndexed { i, _ -> i < attrs.size - 2 }.toIntArray()
-            val final = if (trimmed.contains(EGL14.EGL_NONE)) trimmed
-            else intArrayOf(EGL_RED, EGL_GREEN, EGL_BLUE, EGL_ALPHA, EGL_RENDERABLE, EGL_WINDOW_PBUFFER, EGL14.EGL_NONE)
-            if (!EGL14.eglChooseConfig(display, final, 0, configs, 0, 1, num, 0) || num[0] == 0)
+            // Built explicitly: the previous inline "compact the pair out" loop skipped the
+            // RECORDABLE key but still copied its VALUE one slot early, clobbering the
+            // EGL_SURFACE_TYPE value and making the fallback list unusable.
+            val attrs2 = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8,
+                EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT or EGL_OPENGL_ES3_BIT,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT or EGL14.EGL_PBUFFER_BIT,
+                EGL14.EGL_NONE)
+            if (!EGL14.eglChooseConfig(display, attrs2, 0, configs, 0, 1, num, 0) || num[0] == 0)
                 throw EffectEngineException.EglFailure("eglChooseConfig", EGL14.eglGetError())
         }
         return configs[0]!!
@@ -131,9 +131,5 @@ class EglCore {
         const val EGL_OPENGL_ES3_BIT = 0x40
         const val EGL_RECORDABLE_ANDROID = 0x3142
         const val EGL_CONTEXT_LOST = 0x300E
-        private const val EGL_RED = 0x3024; private const val EGL_GREEN = 0x3023
-        private const val EGL_BLUE = 0x3022; private const val EGL_ALPHA = 0x3021
-        private const val EGL_RENDERABLE = 0x3040
-        private const val EGL_WINDOW_PBUFFER = 0x3033
     }
 }

@@ -298,7 +298,12 @@ class EffectInstance(val definition: EffectDefinition) {
         val startUs = o["startUs"]?.asLong()
         if (startUs != null) {
             windowStartUs = startUs
-            windowDurationUs = (o["durationUs"]?.asLong() ?: Long.MAX_VALUE).coerceAtLeast(1L)
+            // Clamp so start + duration can never overflow negative (a missing/huge durationUs
+            // previously produced Long.MAX_VALUE and made isActiveAt always false -> the effect
+            // never rendered at all).
+            windowDurationUs = (o["durationUs"]?.asLong() ?: Long.MAX_VALUE)
+                .coerceAtLeast(1L)
+                .coerceAtMost(Long.MAX_VALUE - startUs)
         } else {
             windowStartUs = null
             windowDurationUs = Long.MAX_VALUE

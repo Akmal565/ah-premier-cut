@@ -35,7 +35,9 @@ vec4 process(vec4 c, vec2 uv){
     vec3 fireCol = mix(vec3(1.0, 0.30, 0.05), vec3(1.0, 0.85, 0.45), body);
     col = mix(col, max(col, fireCol), clamp(flame, 0.0, 1.0));
     col += exp(-t * 9.0) * 0.65;
-    return vec4(col * u_intensity + c.rgb * (1.0 - u_intensity), c.a);
+    // Template main already mixes by u_intensity — a self-mix here applied intensity twice
+    // (slider 0.5 rendered as 0.75 strength).
+    return vec4(col, c.a);
 }"""
 
     /** fbm-perturbed ink front that breathes in and out over the loop. One pass. */
@@ -58,7 +60,8 @@ vec4 process(vec4 c, vec2 uv){
     vec3 inkCol = vec3(0.02, 0.02, 0.045) * (1.0 + 0.4 * (n - 0.5));
     vec3 stained = mix(inkCol, vec3(0.30, 0.34, 0.42), sheen * 0.35);
     vec3 col = mix(c.rgb, stained, clamp(ink * u_dark, 0.0, 1.0));
-    return vec4(col * u_intensity + c.rgb * (1.0 - u_intensity), c.a);
+    // Template main already mixes by u_intensity.
+    return vec4(col, c.a);
 }"""
 
     /**
@@ -112,7 +115,8 @@ vec4 process(vec4 c, vec2 uv){
     surf *= 0.22 + 0.88 * diff;
     float rim = pow(1.0 - z / max(R, 1.0e-4), 2.5);
     surf += rim * vec3(0.35, 0.55, 0.9) * 0.8;
-    return vec4(mix(c.rgb, surf, inside * u_intensity), c.a);
+    // Gate by the sphere footprint only; u_intensity belongs to the template's final mix.
+    return vec4(mix(c.rgb, surf, inside), c.a);
 }"""
 
     /** Glowing rune rings with counter-rotating ticks, orbiting sparkles and a breathing cast. One pass. */
@@ -150,7 +154,8 @@ vec4 process(vec4 c, vec2 uv){
     vec3 tint = mix(vec3(0.55, 0.25, 0.95), vec3(1.0, 0.78, 0.30), 0.5 + 0.5 * sin(u_hue * 6.2831853 + r * 3.0));
     float breathe = 0.55 + 0.45 * sin(3.14159265 * t);
     vec3 col = c.rgb + tint * glow * breathe;
-    return vec4(col * u_intensity + c.rgb * (1.0 - u_intensity), c.a);
+    // Template main already mixes by u_intensity.
+    return vec4(col, c.a);
 }"""
 
     /** Time-quantized slice displacement plus a step-synced RGB split. One warp pass. */
@@ -197,7 +202,8 @@ vec4 process(vec4 c, vec2 uv){
     vec3 col = c.rgb + fireCol * flame * u_heat;
     float ember = step(0.985, hash21(floor(uv * vec2(220.0, 220.0)) + floor(t * 14.0)));
     col += vec3(1.0, 0.6, 0.2) * ember * band * 1.2;
-    return vec4(col * u_intensity + c.rgb * (1.0 - u_intensity), c.a);
+    // Template main already mixes by u_intensity.
+    return vec4(col, c.a);
 }"""
 
     /** Beat zoom punch with a per-pulse shake and a matching vignette hit. One warp pass. */
@@ -233,7 +239,8 @@ vec4 process(vec4 c, vec2 uv){
     float flash = attack * decay;
     vec3 col = mix(c.rgb, vec3(1.0), clamp(flash, 0.0, 1.0));
     col += u_bloom * decay * 0.25 * (1.0 - luma709(c.rgb));
-    return vec4(col * u_intensity + c.rgb * (1.0 - u_intensity), c.a);
+    // Template main already mixes by u_intensity.
+    return vec4(col, c.a);
 }"""
 
     // ---------------- PHOTO EFFECTS ----------------

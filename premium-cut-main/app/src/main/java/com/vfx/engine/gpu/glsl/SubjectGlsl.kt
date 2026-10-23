@@ -70,7 +70,10 @@ uniform float u_speed;
 uniform float u_glow;
 vec4 process(vec4 c, vec2 uv){
     float m = subjectMask(uv);
-    float edge = subjectEdge(uv);
+    // Gate the edge on u_hasMask like every other body: subjectEdge samples the raw mask
+    // texture, and with no mask bound it falls back to unit 0 (the video itself), whose own
+    // gradient then smeared glow trails across the WHOLE frame.
+    float edge = subjectEdge(uv) * u_hasMask;
     float flow = fbm(vec2(uv.y * 6.0 - u_time * u_speed * 2.2, uv.x * 3.0));
     float streak = smoothstep(0.45, 0.9, flow);
     vec3 trailCol = mix(vec3(0.25, 0.75, 1.0), vec3(0.85, 0.35, 1.0), flow);
@@ -153,7 +156,8 @@ uniform float u_pulse;
 uniform vec3 u_tint;
 vec4 process(vec4 c, vec2 uv){
     float m = subjectMask(uv);
-    float edge = subjectEdge(uv);
+    // Gated like subjectMask — see the LIGHT_TRAILS note above.
+    float edge = subjectEdge(uv) * u_hasMask;
     float breathe = 0.75 + 0.25 * sin(u_time * 2.4) * u_pulse;
     vec3 col = c.rgb + u_tint * edge * 1.5 * u_glow * breathe;
     col += u_tint * m * 0.22 * u_glow * breathe;

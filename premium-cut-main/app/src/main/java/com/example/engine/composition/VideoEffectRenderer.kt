@@ -83,7 +83,9 @@ object VideoEffectRenderer {
           rot += r
         }
         EffectType.ZOOM -> {
-          val pulse = 1.05f + (sin(relTime * 0.006f) * 0.15f * intensity)
+          // The whole pulse must scale with intensity (like SKATER_ZOOM): the old base of 1.05
+          // kept a constant >=5% zoom even at near-zero intensity.
+          val pulse = 1f + (0.05f + sin(relTime * 0.006f) * 0.15f) * intensity
           sX *= pulse
           sY *= pulse
         }

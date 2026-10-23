@@ -429,7 +429,11 @@ fun ArEffectSelectorPanel(
                     }
 
                     val canExport = activeArFilter?.canExport == true
-                    val appliedHere = viewModel.getSelectedVideoClip()?.id?.let { arApplied.containsKey(it) } == true
+                    // Tracked mosaic/blur effects never enter the arOverlay map — they are
+                    // tracked effect clips on the timeline. Count them so the Remove button
+                    // shows for those too (removeArFilterFromClip deletes them).
+                    val appliedHere = viewModel.getSelectedVideoClip()?.id
+                        ?.let { arApplied.containsKey(it) || viewModel.hasTrackedEffectsFor(it) } == true
                     Text(
                         text = arStatus ?: when {
                             canExport -> "Applies a tracked mosaic to the exported video."

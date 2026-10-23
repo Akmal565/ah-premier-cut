@@ -22,19 +22,35 @@ class SeparableBlurRuntime(private val box: Boolean) : MultiPassRuntimeBase() {
         val sigma = s.float("sigma").coerceAtLeast(0.1f)
         val weights = if (box) boxWeights(radius) else gaussianWeights(radius, sigma)
         val p = program(ctx, if (box) "blur.box" else "blur.gaussian", EffectGlsl.SEPARABLE_BLUR)
-        val h = b.addPass("blur.h", p, input) { prog ->
+        // u_dir is the PER-TAP STEP. The tap count already spans +-radius (taps = 2r+1), so the
+        // step must be exactly one texel. Multiplying by radius again spread the kernel over
+        // radius^2 texels (radius 16 -> +-256 px sampled every 16th texel: severe comb/banding
+        // artifacts instead of a blur).
+        val h = b.addPass("blur.h", p, input, outWidth = outW(ctx), outHeight = outH(ctx)) { prog ->
             prog.setFloatArray("u_weights", weights)
             prog.setInt("u_taps", weights.size)
-            prog.setVec2("u_dir", radius / input.width.toFloat(), 0f)
+            prog.setVec2("u_dir", 1f / input.width.toFloat(), 0f)
             setIntensityOne(prog)
         }
-        return b.addPass("blur.v", p, h) { prog ->
+        return b.addPass("blur.v", p, h, outWidth = outW(ctx), outHeight = outH(ctx)) { prog ->
             prog.setFloatArray("u_weights", weights)
             prog.setInt("u_taps", weights.size)
-            prog.setVec2("u_dir", 0f, radius / h.height.toFloat())
+            prog.setVec2("u_dir", 0f, 1f / h.height.toFloat())
             setIntensity(prog, s)   // mix once, on the final pass
         }
     }
+
+    /**
+     * Output size for both passes. Null (default) renders at the frame size; bloom passes a
+     * half-res target so its blur does not silently run at full resolution after the half-res
+     * threshold pass (defeating the documented downsample and doubling fill-rate).
+     */
+    var outputSize: Pair<Int, Int>? = null
+
+    private fun outW(ctx: com.vfx.engine.graph.RenderContext): Int =
+        outputSize?.first ?: ctx.frameWidth
+    private fun outH(ctx: com.vfx.engine.graph.RenderContext): Int =
+        outputSize?.second ?: ctx.frameHeight
 
     private fun gaussianWeights(radius: Int, sigma: Float): FloatArray {
         val n = radius * 2 + 1
@@ -120,7 +136,8 @@ object BlurEffects {
                 EffectSnapshot("unsharp.blur", s.timeUs,
                     mapOf("radius" to s.float("radius"), "sigma" to s.float("sigma")), 1f))
             val p = program(b.renderCtx, "unsharp.combine", EffectGlsl.UNSHARP_COMBINE)
-            b.addSecondaryInput("u_blurred", blurred)
+            // The combine pass binds u_blurred directly in its lambda below; a pre-pass
+            // addSecondaryInput would only patch the blur.v pass (stray sampler binding).
             return b.addPass("unsharp.combine", p, input) { prog ->
                 prog.setTexture("u_blurred", blurred)
                 prog.setFloat("u_amount", s.float("amount"))

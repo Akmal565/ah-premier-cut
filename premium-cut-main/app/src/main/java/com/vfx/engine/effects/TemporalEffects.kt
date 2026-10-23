@@ -41,9 +41,14 @@ object TemporalEffects {
     class MotionTrailRuntime : GpuEffectRuntime {
         override val workingSpace: WorkingSpace = WorkingSpace.GAMMA
 
+        // History rings must be keyed per effect INSTANCE (TemporalEngine contract): s.effectId
+        // is the definition id, so two instances of the same effect (the stack panel supports
+        // duplicate) would interleave into one ping-pong ring.
+        private val ringKey = "temporal.motion_trail#" + java.util.UUID.randomUUID()
+
         override fun buildPasses(builder: GraphBuilder, input: GpuTexture, s: EffectSnapshot): GpuTexture {
             val ctx = builder.renderCtx
-            val slot = ctx.temporal.acquireHistory(s.effectId, input.width, input.height)
+            val slot = ctx.temporal.acquireHistory(ringKey, input.width, input.height)
             val es3 = ctx.caps.glesMajor >= 3
 
             val program = ctx.programs.get(
@@ -52,7 +57,9 @@ object TemporalEffects {
                 ShaderTemplate.fragment(es3, EffectGlsl.MOTION_TRAIL)
             )
 
-            builder.addSecondaryInput("u_history", slot.read.texture)
+            // NOTE: never call builder.addSecondaryInput BEFORE addPassPersistent — it patches
+            // the most recently added pass (or throws when this is the first effect in the
+            // graph). The pass lambda below already binds u_history on the correct pass.
             val accumulated = builder.addPassPersistent("motion_trail.accum", program, input, slot.write) { p ->
                 p.setTexture("u_history", slot.read.texture)
                 p.setFloat("u_decay", s.float("decay"))
@@ -67,9 +74,12 @@ object TemporalEffects {
     class FrameAccumulationRuntime : GpuEffectRuntime {
         override val workingSpace: WorkingSpace = WorkingSpace.GAMMA
 
+        // Per-instance ring key — see MotionTrailRuntime.
+        private val ringKey = "temporal.frame_accumulation#" + java.util.UUID.randomUUID()
+
         override fun buildPasses(builder: GraphBuilder, input: GpuTexture, s: EffectSnapshot): GpuTexture {
             val ctx = builder.renderCtx
-            val slot = ctx.temporal.acquireHistory(s.effectId, input.width, input.height)
+            val slot = ctx.temporal.acquireHistory(ringKey, input.width, input.height)
             val es3 = ctx.caps.glesMajor >= 3
 
             val program = ctx.programs.get(
@@ -78,7 +88,7 @@ object TemporalEffects {
                 ShaderTemplate.fragment(es3, EffectGlsl.FRAME_ACCUMULATE)
             )
 
-            builder.addSecondaryInput("u_history", slot.read.texture)
+            // NOTE: never call builder.addSecondaryInput BEFORE addPassPersistent — see MotionTrailRuntime.
             val accumulated = builder.addPassPersistent("frame_accum.accum", program, input, slot.write) { p ->
                 p.setTexture("u_history", slot.read.texture)
                 p.setFloat("u_decay", s.float("decay"))

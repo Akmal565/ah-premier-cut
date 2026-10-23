@@ -172,16 +172,20 @@ vec3 sampleLutVertical(vec3 color) {
 
 vec3 sampleLutHorizontal(vec3 color) {
   float N = uColorLutLength;
-  float blueCoord = clamp(color.b, 0.0, 1.0) * (N - 1.0);
-  float blueLow = clamp(floor(blueCoord), 0.0, N - 2.0);
-  
-  float lowerX = (0.5 + blueLow * N + clamp(color.r, 0.0, 1.0) * (N - 1.0)) / (N * N);
+  // Standard N²×N strip convention (matches createIdentityLut(vertical=false) below and
+  // Resolve/Adobe exports): tile column = RED index, x-within-tile = BLUE, y = GREEN.
+  // (Was indexed by blue/red transposed: even the class's own generated identity LUT came
+  // back with the red and blue axes swapped.)
+  float redCoord = clamp(color.r, 0.0, 1.0) * (N - 1.0);
+  float redLow = clamp(floor(redCoord), 0.0, N - 2.0);
+
+  float lowerX = (0.5 + redLow * N + clamp(color.b, 0.0, 1.0) * (N - 1.0)) / (N * N);
   float upperX = lowerX + 1.0 / N;
   float y = (0.5 + clamp(color.g, 0.0, 1.0) * (N - 1.0)) / N;
-  
+
   vec3 lowerRgb = texture2D(uColorLut, vec2(lowerX, y)).rgb;
   vec3 upperRgb = texture2D(uColorLut, vec2(upperX, y)).rgb;
-  return mix(lowerRgb, upperRgb, blueCoord - blueLow);
+  return mix(lowerRgb, upperRgb, redCoord - redLow);
 }
 
 void main() {
@@ -194,7 +198,7 @@ void main() {
   }
   
   vec3 mixed = mix(inputColor.rgb, graded, clamp(uIntensity, 0.0, 1.0));
-  gl_FragColor = vec4(clamp(mixed, 0.0, 1.0), inputColor.a);
+  gl_FragColor = vec4(clamp(mixed, 0.0, 1.0), 1.0);
 }
 """
   }
@@ -260,8 +264,15 @@ class LutGlShaderProgram(
       glProgram.setFloatsUniform("uTransformationMatrix", identity)
       glProgram.setFloatsUniform("uTexTransformationMatrix", identity)
 
-      // Upload LUT texture
-      lutTextureId = GlUtil.createTexture(lutBitmap)
+      // Upload LUT texture. SQUARE_HALD images (detected but never renderable: the shader only
+      // knows the two strip layouts, so a 512×512 HALD sampled as a strip produced garbage
+      // colors on every pixel) are converted once to the vertical-strip layout on the CPU.
+      val uploadBitmap = if (format == LutGlEffect.LutFormat.SQUARE_HALD) {
+        haldToVerticalStrip(lutBitmap, lutLength)
+      } else {
+        lutBitmap
+      }
+      lutTextureId = GlUtil.createTexture(uploadBitmap)
       GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTextureId)
       GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
       GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
@@ -271,6 +282,33 @@ class LutGlShaderProgram(
     } catch (e: Exception) {
       throw VideoFrameProcessingException("Failed to initialize LUT shader program", e)
     }
+  }
+
+  /**
+   * Unwraps a square HALD image into the vertical strip layout the shader implements:
+   * linear strip index l = r·N² + g·N + b (x = r·N + b within the N²-wide strip, y = g),
+   * folded into the square at (l % W, l / W). Output is N × N².
+   */
+  private fun haldToVerticalStrip(src: Bitmap, n: Int): Bitmap {
+    val w = src.width
+    val out = Bitmap.createBitmap(n, n * n, Bitmap.Config.ARGB_8888)
+    val srcPixels = IntArray(w * src.height)
+    src.getPixels(srcPixels, 0, w, 0, 0, w, src.height)
+    val outPixels = IntArray(n * n * n)
+    for (r in 0 until n) {
+      for (g in 0 until n) {
+        for (b in 0 until n) {
+          val l = (r * n + g) * n + b
+          val col = l % w
+          val row = l / w
+          if (row < src.height) {
+            outPixels[(r * n + g) * n + b] = srcPixels[row * w + col]
+          }
+        }
+      }
+    }
+    out.setPixels(outPixels, 0, n, 0, 0, n, n * n)
+    return out
   }
 
   override fun configure(inputWidth: Int, inputHeight: Int): Size {
@@ -284,7 +322,14 @@ class LutGlShaderProgram(
       glProgram.setSamplerTexIdUniform("uColorLut", lutTextureId, /* texUnit= */ 1)
       glProgram.setFloatUniform("uColorLutLength", lutLength.toFloat())
       glProgram.setFloatUniform("uIntensity", intensity)
-      glProgram.setIntUniform("uLutType", format.typeId)
+      // SQUARE_HALD is unwrapped to a vertical strip in init; the shader only implements the
+      // two strip layouts, so never hand it typeId 2.
+      val shaderType = if (format == LutGlEffect.LutFormat.SQUARE_HALD) {
+        LutGlEffect.LutFormat.VERTICAL_STRIP.typeId
+      } else {
+        format.typeId
+      }
+      glProgram.setIntUniform("uLutType", shaderType)
 
       glProgram.bindAttributesAndUniforms()
       GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
@@ -303,7 +348,9 @@ class LutGlShaderProgram(
       }
       glProgram.delete()
     } catch (e: Exception) {
-      throw VideoFrameProcessingException("Failed to release LUT shader program", e)
+      // Teardown failures must not escalate: every other release path in this codebase swallows
+      // (a throw here fails the whole processor shutdown for a GL hiccup during cleanup).
+      android.util.Log.w("LutGlShaderProgram", "LUT shader program release failed", e)
     }
   }
 }

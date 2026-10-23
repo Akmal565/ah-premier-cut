@@ -83,13 +83,18 @@ object LightEffects {
                 prog.setFloat("u_knee", s.float("knee"))
                 setIntensityOne(prog)
             }
-            // 2 & 3. Separable blur over the brightpass
-            val blurred = SeparableBlurRuntime(box = false).build(b, thresh,
+            // 2 & 3. Separable blur over the brightpass — INTO the same half-res target.
+            // (The blur passes defaulted to the full frame size, silently undoing the half-res
+            // threshold pass and doubling fill-rate.)
+            val blurRuntime = SeparableBlurRuntime(box = false)
+            blurRuntime.outputSize = halfW to halfH
+            val blurred = blurRuntime.build(b, thresh,
                 EffectSnapshot("bloom.blur", s.timeUs,
                     mapOf("radius" to s.float("radius"), "sigma" to s.float("radius") * 0.5f), 1f))
             // 4. Combine bloom back over original full-res
             val pCombine = program(ctx, "bloom.combine", EffectGlsl.BLOOM_COMBINE)
-            b.addSecondaryInput("u_bloom", blurred)
+            // The combine pass binds u_bloom directly in its lambda below; a pre-pass
+            // addSecondaryInput would only patch the blur.v pass (stray sampler binding).
             return b.addPass("bloom.combine", pCombine, input) { prog ->
                 prog.setTexture("u_bloom", blurred)
                 prog.setFloat("u_bloomIntensity", s.float("intensity"))
@@ -105,7 +110,8 @@ object LightEffects {
                 EffectSnapshot("glow.blur", s.timeUs,
                     mapOf("radius" to s.float("radius"), "sigma" to s.float("radius") * 0.5f), 1f))
             val p = program(b.renderCtx, "glow.combine", EffectGlsl.GLOW_COMBINE)
-            b.addSecondaryInput("u_blurred", blurred)
+            // The combine pass binds u_blurred directly in its lambda below; a pre-pass
+            // addSecondaryInput would only patch the blur.v pass (stray sampler binding).
             return b.addPass("glow.combine", p, input) { prog ->
                 prog.setTexture("u_blurred", blurred)
                 prog.setFloat("u_glowStrength", s.float("strength"))

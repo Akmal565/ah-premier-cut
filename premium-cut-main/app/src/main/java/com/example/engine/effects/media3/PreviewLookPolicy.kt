@@ -109,6 +109,11 @@ object PreviewLookPolicy {
     if (prev.tracks != next.tracks) return false
     if (prev.markers != next.markers) return false
     if (prev.captionSpeakers != next.captionSpeakers) return false
+    // Audio lane roles / ducking feed the player's audio graph, which replaceTimelineLooks
+    // never reconfigures — treating those edits as look-only silently swallowed them until the
+    // next structural change restarted the timeline.
+    if (prev.audioLaneRoles != next.audioLaneRoles) return false
+    if (prev.audioDucking != next.audioDucking) return false
     if (prev.version != next.version) return false
     return clipsLookOnly(prev.videoClips, next.videoClips, chromaHandledByCompositor) &&
       clipsLookOnly(prev.overlayClips, next.overlayClips, chromaHandledByCompositor)

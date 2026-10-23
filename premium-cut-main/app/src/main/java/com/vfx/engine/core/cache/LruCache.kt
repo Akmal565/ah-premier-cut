@@ -4,8 +4,13 @@ package com.vfx.engine.core.cache
  * Deterministic, thread-safe LRU cache used for shader programs, LUT textures,
  * curve textures and effect definitions. Keys must be content-derived
  * (deterministic) so cache hits are stable across runs.
+ *
+ * [onEvict] is invoked when an entry is evicted by [put]/[getOrPut] exceeding [maxSize].
+ * GPU-backed values (ShaderProgram, GpuTexture) MUST pass one, or every eviction leaks the GL
+ * object until context loss. NOTE: [clear] keeps its explicit-releaser contract (callers that
+ * drop entries after context loss pass null and must not trigger GL calls via [onEvict]).
  */
-class LruCache<K, V>(private val maxSize: Int) {
+class LruCache<K, V>(private val maxSize: Int, private val onEvict: ((V) -> Unit)? = null) {
 
     private val map = LinkedHashMap<K, V>(16, 0.75f, true)
 
@@ -59,8 +64,9 @@ class LruCache<K, V>(private val maxSize: Int) {
     private fun evictIfNeeded() {
         while (map.size > maxSize) {
             val eldest = map.entries.iterator()
-            eldest.next()
+            val v = eldest.next().value
             eldest.remove()
+            onEvict?.invoke(v)
         }
     }
 }

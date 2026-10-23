@@ -263,9 +263,17 @@ object Media3EffectPipeline {
    */
   fun createStyleTransferEffect(
     type: StyleTransferType,
-    intensity: Float = 1.0f
+    intensity: Float = 1.0f,
+    windowStartUs: Long? = null,
+    windowDurationUs: Long = Long.MAX_VALUE,
   ): CustomShaderGlEffect? {
     if (type == StyleTransferType.NONE || intensity <= 0.01f) return null
+    // Per-frame play-window ramp (same semantics as PreviewVfxEffects' shader binder): the
+    // Media3 graph is static, so windowed effects must gate their own intensity per frame.
+    val gate: (Long) -> Float = { pts ->
+      if (windowStartUs == null) 1f
+      else PreviewVfxEffects.windowRamp(pts, windowStartUs, windowDurationUs)
+    }
 
     return when (type) {
       StyleTransferType.NONE -> null
@@ -306,8 +314,8 @@ void main() {
         CustomShaderGlEffect(
           name = "AnimeCelShadingEffect",
           fragmentShader = shader,
-          uniformBinder = { program: GlProgram, _, width: Int, height: Int ->
-            program.setFloatUniform("uIntensity", intensity)
+          uniformBinder = { program: GlProgram, presentationTimeUs: Long, width: Int, height: Int ->
+            program.setFloatUniform("uIntensity", intensity * gate(presentationTimeUs))
             val w = if (width > 0) width.toFloat() else 1920f
             val h = if (height > 0) height.toFloat() else 1080f
             program.setFloatsUniform("uTexelSize", floatArrayOf(1.0f / w, 1.0f / h))
@@ -382,8 +390,8 @@ void main() {
         CustomShaderGlEffect(
           name = "OilPaintingKuwaharaEffect",
           fragmentShader = shader,
-          uniformBinder = { program: GlProgram, _, width: Int, height: Int ->
-            program.setFloatUniform("uIntensity", intensity)
+          uniformBinder = { program: GlProgram, presentationTimeUs: Long, width: Int, height: Int ->
+            program.setFloatUniform("uIntensity", intensity * gate(presentationTimeUs))
             val w = if (width > 0) width.toFloat() else 1920f
             val h = if (height > 0) height.toFloat() else 1080f
             program.setFloatsUniform("uTexelSize", floatArrayOf(1.0f / w, 1.0f / h))
@@ -419,8 +427,8 @@ void main() {
         CustomShaderGlEffect(
           name = "SketchCharcoalEffect",
           fragmentShader = shader,
-          uniformBinder = { program: GlProgram, _, width: Int, height: Int ->
-            program.setFloatUniform("uIntensity", intensity)
+          uniformBinder = { program: GlProgram, presentationTimeUs: Long, width: Int, height: Int ->
+            program.setFloatUniform("uIntensity", intensity * gate(presentationTimeUs))
             val w = if (width > 0) width.toFloat() else 1920f
             val h = if (height > 0) height.toFloat() else 1080f
             program.setFloatsUniform("uTexelSize", floatArrayOf(1.0f / w, 1.0f / h))
@@ -460,8 +468,8 @@ void main() {
         CustomShaderGlEffect(
           name = "CyberpunkNeonEffect",
           fragmentShader = shader,
-          uniformBinder = { program: GlProgram, _, width: Int, height: Int ->
-            program.setFloatUniform("uIntensity", intensity)
+          uniformBinder = { program: GlProgram, presentationTimeUs: Long, width: Int, height: Int ->
+            program.setFloatUniform("uIntensity", intensity * gate(presentationTimeUs))
             val w = if (width > 0) width.toFloat() else 1920f
             val h = if (height > 0) height.toFloat() else 1080f
             program.setFloatsUniform("uTexelSize", floatArrayOf(1.0f / w, 1.0f / h))
@@ -500,8 +508,8 @@ void main() {
         CustomShaderGlEffect(
           name = "DreamyBloomEffect",
           fragmentShader = shader,
-          uniformBinder = { program: GlProgram, _, width: Int, height: Int ->
-            program.setFloatUniform("uIntensity", intensity)
+          uniformBinder = { program: GlProgram, presentationTimeUs: Long, width: Int, height: Int ->
+            program.setFloatUniform("uIntensity", intensity * gate(presentationTimeUs))
             val w = if (width > 0) width.toFloat() else 1920f
             val h = if (height > 0) height.toFloat() else 1080f
             program.setFloatsUniform("uTexelSize", floatArrayOf(1.0f / w, 1.0f / h))
@@ -536,8 +544,8 @@ void main() {
         CustomShaderGlEffect(
           name = "HalftoneComicEffect",
           fragmentShader = shader,
-          uniformBinder = { program: GlProgram, _, _, _ ->
-            program.setFloatUniform("uIntensity", intensity)
+          uniformBinder = { program: GlProgram, presentationTimeUs: Long, _, _ ->
+            program.setFloatUniform("uIntensity", intensity * gate(presentationTimeUs))
           }
         )
       }
@@ -547,7 +555,11 @@ void main() {
   /**
    * Creates a custom RGB Split (chromatic aberration) shader effect using [CustomShaderGlEffect].
    */
-  fun createRgbSplitEffect(intensity: Float = 0.5f): CustomShaderGlEffect {
+  fun createRgbSplitEffect(
+    intensity: Float = 0.5f,
+    windowStartUs: Long? = null,
+    windowDurationUs: Long = Long.MAX_VALUE,
+  ): CustomShaderGlEffect {
     val fragmentShader = """#version 100
 precision mediump float;
 uniform sampler2D uTexSampler;
@@ -561,14 +573,16 @@ void main() {
   float g = texture2D(uTexSampler, uv).g;
   float b = texture2D(uTexSampler, clamp(uv - offset, 0.0, 1.0)).b;
   float a = texture2D(uTexSampler, uv).a;
-  gl_FragColor = vec4(r, g, b, a);
+  gl_FragColor = vec4(r, g, b, 1.0);
 }
 """
     return CustomShaderGlEffect(
       name = "RgbSplitEffect",
       fragmentShader = fragmentShader,
-      uniformBinder = { program: GlProgram, _, _, _ ->
-        program.setFloatUniform("uIntensity", intensity)
+      uniformBinder = { program: GlProgram, presentationTimeUs: Long, _, _ ->
+        val ramp = if (windowStartUs == null) 1f
+        else PreviewVfxEffects.windowRamp(presentationTimeUs, windowStartUs, windowDurationUs)
+        program.setFloatUniform("uIntensity", intensity * ramp)
       }
     )
   }
@@ -576,7 +590,11 @@ void main() {
   /**
    * Creates a custom Glitch shader effect using [CustomShaderGlEffect].
    */
-  fun createGlitchEffect(intensity: Float = 0.5f): CustomShaderGlEffect {
+  fun createGlitchEffect(
+    intensity: Float = 0.5f,
+    windowStartUs: Long? = null,
+    windowDurationUs: Long = Long.MAX_VALUE,
+  ): CustomShaderGlEffect {
     val fragmentShader = """#version 100
 precision mediump float;
 uniform sampler2D uTexSampler;
@@ -603,14 +621,16 @@ void main() {
   float g = texture2D(uTexSampler, uvG).g;
   float b = texture2D(uTexSampler, uvB).b;
   float a = texture2D(uTexSampler, uvG).a;
-  gl_FragColor = vec4(r, g, b, a);
+  gl_FragColor = vec4(r, g, b, 1.0);
 }
 """
     return CustomShaderGlEffect(
       name = "GlitchEffect",
       fragmentShader = fragmentShader,
       uniformBinder = { program: GlProgram, presentationTimeUs: Long, _, _ ->
-        program.setFloatUniform("uIntensity", intensity)
+        val ramp = if (windowStartUs == null) 1f
+        else PreviewVfxEffects.windowRamp(presentationTimeUs, windowStartUs, windowDurationUs)
+        program.setFloatUniform("uIntensity", intensity * ramp)
         program.setFloatUniform("uTime", (presentationTimeUs / 1_000_000.0).toFloat())
       }
     )

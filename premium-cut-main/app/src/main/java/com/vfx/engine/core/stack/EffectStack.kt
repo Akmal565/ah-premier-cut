@@ -137,7 +137,13 @@ class EffectStack(val registry: EffectRegistry = EffectRegistry()) {
         for ((i, ej) in items.withIndex()) {
             val ejo = ej.asObj() ?: continue
             val eid = ejo["effectId"]?.asStr()
-                ?: throw EffectEngineException.Serialization("Effect[$i] missing 'effectId'")
+            if (eid == null) {
+                // Lenient mode must SKIP corrupt entries (documented contract: "project still
+                // loads"); throwing here made one bad entry wipe the WHOLE stack via the
+                // host's runCatching { }.onFailure { clear() }.
+                if (!lenient) throw EffectEngineException.Serialization("Effect[$i] missing 'effectId'")
+                continue
+            }
             val def = registry.getEffectOrNull(eid)
             if (def == null) {
                 if (lenient) continue

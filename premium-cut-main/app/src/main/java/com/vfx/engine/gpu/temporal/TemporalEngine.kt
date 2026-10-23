@@ -46,15 +46,26 @@ class TemporalEngine {
 
     fun acquireHistory(key: String, width: Int, height: Int): HistorySlot {
         val r = ring(key, 2, width, height)
-        val readFbo = r.readSlot() ?: r.writeSlot()
-        val writeFbo = if (r.primed) r.writeSlot() else r.slots[1]
+        // Frame 1 must read the OTHER slot and write slots[writeIndex]. The old code wrote
+        // slots[1] on frame 1 (breaking the ring invariant): frame 2 then read the still-
+        // uninitialized slots[0] AND overwrote frame 1's output in slots[1], so the trail
+        // started two frames late from garbage. With the write always at writeIndex the read
+        // slot (writeIndex+1)%size is exactly the previous frame's output from frame 2 on.
+        val readFbo = r.readSlot() ?: r.slots[(r.writeIndex + 1) % r.slots.size]
+        val writeFbo = r.writeSlot()
         return HistorySlot(readFbo, writeFbo) { r.advance() }
     }
 
     /** Reset one ring (by key) or all (seek / global flush). */
     fun reset(key: String? = null) {
-        if (key == null) rings.clear()
-        else rings.remove(key)
+        if (key == null) {
+            rings.values.forEach { r -> r.slots.forEach { it.release() } }
+            rings.clear()
+        } else {
+            // Release the persistent textures/FBOs before dropping the reference, or every
+            // seek/scrub orphaned GL objects until context loss.
+            rings.remove(key)?.let { r -> r.slots.forEach { it.release() } }
+        }
     }
 
     fun onContextLost() = rings.clear()

@@ -34,7 +34,30 @@ object PreviewVfxEffects {
 
   fun signature(clip: VideoClip?): String = clip?.vfxStackJson.orEmpty()
 
+  /**
+   * Play window of the effect currently being converted by [toMedia3]. The Media3 graph is
+   * built once and is time-independent, but the uniform binder runs PER FRAME — so the window
+   * ramps uIntensity down to 0 outside [startUs, start+duration) exactly like the compositor's
+   * windowedIntensityAt. Without this, a windowed VFX covered the WHOLE clip on the fallback
+   * preview path while export honored the 3 s window.
+   * Set/cleared around the `when` in [toMedia3]; consumed by [shader] (and forwarded to the
+   * Media3EffectPipeline legacy creators). Single-threaded: effectsFor runs on the main thread.
+   */
+  private var pendingWindowStartUs: Long? = null
+  private var pendingWindowDurationUs: Long = Long.MAX_VALUE
+
   fun toMedia3(instance: EffectInstance): Effect? {
+    pendingWindowStartUs = instance.windowStartUs
+    pendingWindowDurationUs = instance.windowDurationUs
+    return try {
+      buildMedia3Effect(instance)
+    } finally {
+      pendingWindowStartUs = null
+      pendingWindowDurationUs = Long.MAX_VALUE
+    }
+  }
+
+  private fun buildMedia3Effect(instance: EffectInstance): Effect? {
     val intensity = instance.intensity.coerceIn(0f, 1f)
     return when (instance.definition.id) {
       // ---- The ten Video Effects assets (engine bodies in EffectGlsl). ----
@@ -207,15 +230,19 @@ object PreviewVfxEffects {
       )
 
       // ---- Engine effects used by the Photo / AI assets and the VFX stack panel. ----
-      "distort.glitch" -> Media3EffectPipeline.createGlitchEffect(intensity)
-      "chromatic.aberration", "chromatic.rgbSplit" -> Media3EffectPipeline.createRgbSplitEffect(intensity)
+      "distort.glitch" -> Media3EffectPipeline.createGlitchEffect(
+        intensity, pendingWindowStartUs, pendingWindowDurationUs)
+      "chromatic.aberration", "chromatic.rgbSplit" -> Media3EffectPipeline.createRgbSplitEffect(
+        intensity, pendingWindowStartUs, pendingWindowDurationUs)
       "blur.directional" -> directionalBlur(intensity)
       "light.leak" -> lightLeak(intensity)
       "color.hdr" -> hdr(intensity)
       "color.pop" -> colorPop(intensity)
       "sharpen.unsharp", "sharpen.sharpen" -> sharpen(intensity)
-      "stylize.sketch" -> Media3EffectPipeline.createStyleTransferEffect(StyleTransferType.SKETCH_CHARCOAL, intensity)
-      "stylize.halftone" -> Media3EffectPipeline.createStyleTransferEffect(StyleTransferType.HALFTONE_COMIC, intensity)
+      "stylize.sketch" -> Media3EffectPipeline.createStyleTransferEffect(
+        StyleTransferType.SKETCH_CHARCOAL, intensity, pendingWindowStartUs, pendingWindowDurationUs)
+      "stylize.halftone" -> Media3EffectPipeline.createStyleTransferEffect(
+        StyleTransferType.HALFTONE_COMIC, intensity, pendingWindowStartUs, pendingWindowDurationUs)
       "stylize.posterize" -> posterize(intensity)
       "stylize.pixelate" -> pixelate(intensity)
       "stylize.duotone" -> duotone(intensity)
@@ -765,8 +792,9 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
   vec3 fireCol = mix(vec3(1.0, 0.30, 0.05), vec3(1.0, 0.85, 0.45), body);
   col = mix(col, max(col, fireCol), clamp(flame, 0.0, 1.0));
   col += exp(-t * 9.0) * 0.65;
-  vec3 result = col * uIntensity + base.rgb * (1.0 - uIntensity);
-  gl_FragColor = vec4(clamp(mix(base.rgb, result, uIntensity), 0.0, 1.0), base.a);
+  // Mirror parity: the export body no longer self-mixes (ShaderTemplate's main owns the
+  // intensity ramp), so preview must not either — a self-mix rendered intensity 0.5 as 0.75.
+  gl_FragColor = vec4(clamp(mix(base.rgb, col, uIntensity), 0.0, 1.0), base.a);
 """,
       binder = { program, _, _, _ ->
         program.setFloatUniform("uScale", scale)
@@ -798,8 +826,9 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
   vec3 inkCol = vec3(0.02, 0.02, 0.045) * (1.0 + 0.4 * (n - 0.5));
   vec3 stained = mix(inkCol, vec3(0.30, 0.34, 0.42), sheen * 0.35);
   vec3 col = mix(base.rgb, stained, clamp(ink * uDark, 0.0, 1.0));
-  vec3 result = col * uIntensity + base.rgb * (1.0 - uIntensity);
-  gl_FragColor = vec4(clamp(mix(base.rgb, result, uIntensity), 0.0, 1.0), base.a);
+  // Mirror parity: the export body no longer self-mixes (ShaderTemplate's main owns the
+  // intensity ramp), so preview must not either — a self-mix rendered intensity 0.5 as 0.75.
+  gl_FragColor = vec4(clamp(mix(base.rgb, col, uIntensity), 0.0, 1.0), base.a);
 """,
       binder = { program, _, _, _ ->
         program.setFloatUniform("uSpread", spread)
@@ -891,8 +920,9 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
   vec3 tint = mix(vec3(0.55, 0.25, 0.95), vec3(1.0, 0.78, 0.30), 0.5 + 0.5 * sin(uHue * 6.2831853 + r * 3.0));
   float breathe = 0.55 + 0.45 * sin(3.14159265 * t);
   vec3 col = base.rgb + tint * glow * breathe;
-  vec3 result = col * uIntensity + base.rgb * (1.0 - uIntensity);
-  gl_FragColor = vec4(clamp(mix(base.rgb, result, uIntensity), 0.0, 1.0), base.a);
+  // Mirror parity: the export body no longer self-mixes (ShaderTemplate's main owns the
+  // intensity ramp), so preview must not either — a self-mix rendered intensity 0.5 as 0.75.
+  gl_FragColor = vec4(clamp(mix(base.rgb, col, uIntensity), 0.0, 1.0), base.a);
 """,
       binder = { program, _, _, _ ->
         program.setFloatUniform("uScale", scale)
@@ -952,8 +982,9 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
   vec3 col = base.rgb + fireCol * flame * uHeat;
   float ember = step(0.985, hash21(floor(uv * vec2(220.0, 220.0)) + floor(t * 14.0)));
   col += vec3(1.0, 0.6, 0.2) * ember * band * 1.2;
-  vec3 result = col * uIntensity + base.rgb * (1.0 - uIntensity);
-  gl_FragColor = vec4(clamp(mix(base.rgb, result, uIntensity), 0.0, 1.0), base.a);
+  // Mirror parity: the export body no longer self-mixes (ShaderTemplate's main owns the
+  // intensity ramp), so preview must not either — a self-mix rendered intensity 0.5 as 0.75.
+  gl_FragColor = vec4(clamp(mix(base.rgb, col, uIntensity), 0.0, 1.0), base.a);
 """,
       binder = { program, _, _, _ ->
         program.setFloatUniform("uHeight", height)
@@ -1003,8 +1034,9 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
   float flash = attack * decay;
   vec3 col = mix(base.rgb, vec3(1.0), clamp(flash, 0.0, 1.0));
   col += uBloom * decay * 0.25 * (1.0 - luma709(base.rgb));
-  vec3 result = col * uIntensity + base.rgb * (1.0 - uIntensity);
-  gl_FragColor = vec4(clamp(mix(base.rgb, result, uIntensity), 0.0, 1.0), base.a);
+  // Mirror parity: the export body no longer self-mixes (ShaderTemplate's main owns the
+  // intensity ramp), so preview must not either — a self-mix rendered intensity 0.5 as 0.75.
+  gl_FragColor = vec4(clamp(mix(base.rgb, col, uIntensity), 0.0, 1.0), base.a);
 """,
       binder = { program, _, _, _ ->
         program.setFloatUniform("uSpeed", speed)
@@ -1224,6 +1256,10 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
     val usesIntensity = body.contains("uIntensity")
     val usesTime = body.contains("uTime")
     val usesTexel = body.contains("uTexelSize")
+    // Capture the pending play window at construction: later toMedia3 calls must not affect
+    // already-built effects.
+    val windowStartUs = pendingWindowStartUs
+    val windowDurationUs = pendingWindowDurationUs
     val fragment = buildString {
       append("#version 100\n")
       // highp where the driver offers it (all modern GPUs): the trend mirrors reuse the
@@ -1241,13 +1277,21 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
       if (uniforms.isNotBlank()) append(uniforms).append('\n')
       append("void main() {\n")
       append(body)
+      // Decoder intermediates can carry A=0; a VFX node that propagates it composites as a
+      // black frame. The resident color-grading node currently forces alpha upstream, but
+      // every preview body must be self-sufficient (same guarantee as IDENTITY_FRAGMENT_SHADER).
+      append("\n  gl_FragColor.a = 1.0;")
       append("\n}\n")
     }
     return CustomShaderGlEffect(
       name = name,
       fragmentShader = fragment,
       uniformBinder = { program, presentationTimeUs, width, height ->
-        if (usesIntensity) program.setFloatUniform("uIntensity", intensity)
+        if (usesIntensity) {
+          val ramp = if (windowStartUs == null) 1f
+          else windowRamp(presentationTimeUs, windowStartUs, windowDurationUs)
+          program.setFloatUniform("uIntensity", intensity * ramp)
+        }
         if (usesTime) program.setFloatUniform("uTime", (presentationTimeUs / 1_000_000.0).toFloat())
         if (usesTexel) {
           val w = if (width > 0) width.toFloat() else 1920f
@@ -1257,5 +1301,20 @@ vec3 blendScreen(vec3 b, vec3 s){ return b + s - b * s; }
         binder(program, presentationTimeUs, width, height)
       }
     )
+  }
+
+  /**
+   * Same smoothstep edge ramp as [com.vfx.engine.core.effect.EffectInstance.windowedIntensityAt]:
+   * 1 in the window interior, fading over 220 ms at both edges, 0 outside the window.
+   */
+  internal fun windowRamp(presentationTimeUs: Long, startUs: Long, durationUs: Long): Float {
+    if (presentationTimeUs < startUs || presentationTimeUs >= startUs + durationUs) return 0f
+    val rampUs = 220_000f
+    val into = (presentationTimeUs - startUs).toFloat()
+    val remain = (startUs + durationUs - presentationTimeUs).toFloat()
+    val left = (into / rampUs).coerceIn(0f, 1f)
+    val right = (remain / rampUs).coerceIn(0f, 1f)
+    fun smooth(x: Float): Float { val c = x.coerceIn(0f, 1f); return c * c * (3f - 2f * c) }
+    return smooth(left) * smooth(right)
   }
 }

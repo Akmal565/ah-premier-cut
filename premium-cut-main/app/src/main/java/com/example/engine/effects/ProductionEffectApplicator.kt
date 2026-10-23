@@ -87,14 +87,12 @@ object ProductionEffectApplicator {
     var next = clip
     val vfxIds = keys.filter { it.startsWith("vfx:") }.map { it.removePrefix("vfx:") }.toSet()
     if (vfxIds.isNotEmpty()) next = next.copy(vfxStackJson = removeVfx(next.vfxStackJson, vfxIds))
-    if (keys.any { it.startsWith("face:") }) {
-      val cleared = DeformationCodec.decode(next.faceReshape).copy(
-        eyeEnlarge = 0f, faceSlim = 0f, jawSharp = 0f, noseReshape = 0f,
-        chinAdjust = 0f, smileAdjust = 0f, skinSmooth = 0f, teethWhiten = 0f,
-        bigHead = 0f, smallFace = 0f, funny = 0f, alienEyes = 0f,
-        melt = 0f, chubby = 0f, wink = 0f, curls = 0f,
-        browAdjust = 0f, autoBlink = 0f
-      )
+    // Zero ONLY the warp channels this category's face: keys map to. The old blanket reset
+    // wiped all 18 channels, so e.g. clearing PHOTO_EFFECTS ("Perm Curls") also destroyed the
+    // user's FACE_EFFECTS look ("Chubby Cheeks") and their Face-Reshape slider values.
+    val faceKinds = keys.filter { it.startsWith("face:") }.map { it.removePrefix("face:") }.toSet()
+    if (faceKinds.isNotEmpty()) {
+      val cleared = zeroFaceChannels(DeformationCodec.decode(next.faceReshape), faceKinds)
       next = next.copy(faceReshape = DeformationCodec.encode(cleared))
     }
     if (keys.any { it.startsWith("body:") }) next = next.copy(bodyReshape = null)
@@ -105,6 +103,33 @@ object ProductionEffectApplicator {
       }
     }
     return next
+  }
+
+  /** Returns [current] with only the warp channels named by [kinds] reset to 0. */
+  private fun zeroFaceChannels(current: DeformationParams, kinds: Set<String>): DeformationParams {
+    var p = current
+    for (kind in kinds) {
+      p = when (kind) {
+        "reshape" -> p.copy(
+          eyeEnlarge = 0f, faceSlim = 0f, jawSharp = 0f,
+          noseReshape = 0f, chinAdjust = 0f, smileAdjust = 0f,
+        )
+        "slim" -> p.copy(faceSlim = 0f)
+        "eyes" -> p.copy(eyeEnlarge = 0f)
+        "skin" -> p.copy(skinSmooth = 0f)
+        "teeth" -> p.copy(teethWhiten = 0f)
+        "big_head" -> p.copy(bigHead = 0f)
+        "small" -> p.copy(smallFace = 0f)
+        "funny" -> p.copy(funny = 0f)
+        "alien" -> p.copy(alienEyes = 0f)
+        "melt" -> p.copy(melt = 0f)
+        "chubby" -> p.copy(chubby = 0f)
+        "wink" -> p.copy(wink = 0f)
+        "curls" -> p.copy(curls = 0f)
+        else -> p
+      }
+    }
+    return p
   }
 
   private fun faceParams(current: DeformationParams, kind: String, amount: Float): DeformationParams = when (kind) {

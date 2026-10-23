@@ -256,7 +256,10 @@ vec4 process(vec4 c, vec2 uv){
     for (int dy = -1; dy <= 1; dy++)
     for (int dx = -1; dx <= 1; dx++) {
         vec3 s = texture(u_tex, clampUv(uv + vec2(float(dx), float(dy)) * u_texel)).rgb;
-        float w = (dx == 0 && dy == 0) ? (1.0 + 4.0 * u_amount) : -u_amount;
+        // Center weight must be 1 + 8*amount: 8 negative neighbours at -amount need 8*amount
+        // extra center gain for the kernel to sum to 1 (1 + 4a left DC gain at 1 - 4a, so any
+        // amount > 0.25 inverted/darkened flat regions toward black).
+        float w = (dx == 0 && dy == 0) ? (1.0 + 8.0 * u_amount) : -u_amount;
         acc += s * w;
     }
     c.rgb = acc;
@@ -611,20 +614,23 @@ vec4 process(vec4 c, vec2 uv){
 }"""
 
     // ---------------- TEMPORAL ----------------
+    // The sampler is named u_history to match TemporalEffects' p.setTexture("u_history", ...).
+    // (Was u_prev: the runtime bound u_history, the uniform never got its texture and fell back
+    // to unit 0 = the current input, making both temporal effects silent no-ops.)
     const val TRAILS = """
-uniform sampler2D u_prev;
+uniform sampler2D u_history;
 uniform float u_decay;
 vec4 process(vec4 c, vec2 uv){
-    vec3 prev = texture(u_prev, uv).rgb * u_decay;
+    vec3 prev = texture(u_history, uv).rgb * u_decay;
     c.rgb = max(c.rgb, prev);
     return c;
 }"""
 
     const val ACCUMULATE = """
-uniform sampler2D u_prev;
+uniform sampler2D u_history;
 uniform float u_alpha;
 vec4 process(vec4 c, vec2 uv){
-    vec3 prev = texture(u_prev, uv).rgb;
+    vec3 prev = texture(u_history, uv).rgb;
     c.rgb = mix(prev, c.rgb, clamp(u_alpha, 0.0, 1.0));
     return c;
 }"""

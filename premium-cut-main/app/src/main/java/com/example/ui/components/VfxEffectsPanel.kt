@@ -178,8 +178,24 @@ fun VfxEffectsPanel(
             canMoveDown = i < stack.size - 1,
             onToggleExpand = { expanded = if (expanded == i) -1 else i },
             onEnabled = { commit(VfxEffectsHost.setEnabled(json, i, it)) },
-            onUp = { commit(VfxEffectsHost.move(json, i, i - 1)); if (expanded == i) expanded = i - 1 },
-            onDown = { commit(VfxEffectsHost.move(json, i, i + 1)); if (expanded == i) expanded = i + 1 },
+            onUp = {
+              commit(VfxEffectsHost.move(json, i, i - 1))
+              // Remap BOTH displaced indices: only fixing the moved card left the neighbour's
+              // expanded state pointing at the wrong effect after a swap.
+              expanded = when (expanded) {
+                i -> i - 1
+                i - 1 -> i
+                else -> expanded
+              }
+            },
+            onDown = {
+              commit(VfxEffectsHost.move(json, i, i + 1))
+              expanded = when (expanded) {
+                i -> i + 1
+                i + 1 -> i
+                else -> expanded
+              }
+            },
             onDuplicate = { commit(VfxEffectsHost.duplicate(json, i)) },
             onDelete = { commit(VfxEffectsHost.removeAt(json, i)); expanded = -1 },
             onReset = { commit(VfxEffectsHost.resetEffect(json, i)) },

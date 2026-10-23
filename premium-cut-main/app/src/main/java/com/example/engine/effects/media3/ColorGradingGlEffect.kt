@@ -338,7 +338,10 @@ void main() {
       program.setFloatUniform("uGlow", snapshot.glow)
       program.setFloatUniform("uVignette", snapshot.vignette)
       program.setFloatUniform("uGrain", snapshot.grain)
-      program.setFloatUniform("uGrainSeed", (presentationTimeUs / 1000L % 10000).toFloat() / 1000f)
+      // Per-frame seed over the full second fraction: the old % 10000 ms wrapped the grain
+      // pattern every 10 s of media time (visible as a repeating texture on static shots).
+      program.setFloatUniform("uGrainSeed", (presentationTimeUs % 1_000_000L) / 1_000_000f
+        + (presentationTimeUs / 1_000_000L % 97L))
       program.setFloatUniform("uSharpness", snapshot.sharpness)
       program.setFloatUniform("uClarity", snapshot.clarity)
 

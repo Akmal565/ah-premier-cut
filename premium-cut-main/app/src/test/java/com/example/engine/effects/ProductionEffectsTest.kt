@@ -99,11 +99,19 @@ class ProductionEffectsTest {
     assertEquals("photo.doll", ProductionEffectApplicator.appliedOn(doll, EffectCategory.PHOTO_EFFECTS)?.id)
     assertEquals(0.9f, ProductionEffectApplicator.intensityOn(doll, ProductionEffectCatalog.byId("photo.doll")!!), 1e-4f)
     val cleared = ProductionEffectApplicator.clearCategory(doll, EffectCategory.FACE_EFFECTS)
-    assertNull(cleared.faceReshape)
-    // Clearing PHOTO also wipes the shared face-reshape struct (documented semantics:
-    // the warp channels live in one struct, so a category clear resets all of them).
+    // Clearing FACE zeroes only the face-category channels (funny, alienEyes); the photo
+    // category's bigHead must SURVIVE — clearCategory's contract is "leaves every other
+    // category on the clip" (the old blanket reset silently destroyed other categories).
+    val clearedParams = DeformationCodec.decode(cleared.faceReshape)
+    assertEquals(0f, clearedParams.funny, 1e-4f)
+    assertEquals(0f, clearedParams.alienEyes, 1e-4f)
+    assertEquals(0.9f, clearedParams.bigHead, 1e-4f)
+    // Clearing PHOTO zeroes only its own channels (bigHead) and leaves the face look intact.
     val noPhoto = ProductionEffectApplicator.clearCategory(doll, EffectCategory.PHOTO_EFFECTS)
-    assertNull(noPhoto.faceReshape)
+    val noPhotoParams = DeformationCodec.decode(noPhoto.faceReshape)
+    assertEquals(0.7f, noPhotoParams.funny, 1e-4f)
+    assertEquals(0.4f, noPhotoParams.alienEyes, 1e-4f)
+    assertEquals(0f, noPhotoParams.bigHead, 1e-4f)
   }
 
   @Test
